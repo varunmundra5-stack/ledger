@@ -765,6 +765,110 @@ class LocalConversation(BaseConversation):
             )
             self._on_event(user_msg_event)
 
+    def _check_loop_state(self) -> str:
+        """Check execution status and return a loop directive.
+
+        Must be called while ``self._state`` lock is held.
+
+        Returns:
+            ``"break"`` – exit the loop
+            ``"continue"`` – skip to the next iteration
+            ``"step"`` – proceed with an agent step
+        """
+        if self._state.execution_status in [
+            ConversationExecutionStatus.PAUSED,
+            ConversationExecutionStatus.STUCK,
+        ]:
+            return "break"
+
+        if self._state.execution_status == ConversationExecutionStatus.FINISHED:
+            if self._hook_processor is not None:
+                should_stop, feedback = self._hook_processor.run_stop(
+                    reason="agent_finished"
+                )
+                if not should_stop:
+                    logger.info("Stop hook denied agent stopping")
+                    if feedback:
+                        prefixed = f"[Stop hook feedback] {feedback}"
+                        self._on_event(
+                            MessageEvent(
+                                source="environment",
+                                llm_message=Message(
+                                    role="user",
+                                    content=[TextContent(text=prefixed)],
+                                ),
+                            )
+                        )
+                    self._state.execution_status = ConversationExecutionStatus.RUNNING
+                    return "continue"
+            return "break"
+
+        if self._stuck_detector:
+            if self._stuck_detector.is_stuck():
+                logger.warning("Stuck pattern detected.")
+                self._state.execution_status = ConversationExecutionStatus.STUCK
+                return "continue"
+
+        if (
+            self._state.execution_status
+            == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        ):
+            self._state.execution_status = ConversationExecutionStatus.RUNNING
+
+        return "step"
+
+    def _check_post_step(self, iteration: int) -> str | None:
+        """Check post-step conditions. Returns ``"break"`` or None."""
+        if (
+            self.state.execution_status
+            == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        ):
+            return "break"
+
+        if iteration >= self.max_iteration_per_run:
+            if self._state.execution_status == ConversationExecutionStatus.FINISHED:
+                return "break"
+            error_msg = (
+                f"Agent reached maximum iterations limit "
+                f"({self.max_iteration_per_run})."
+            )
+            logger.error(error_msg)
+            self._state.execution_status = ConversationExecutionStatus.ERROR
+            self._on_event(
+                ConversationErrorEvent(
+                    source="environment",
+                    code="MaxIterationsReached",
+                    detail=error_msg,
+                )
+            )
+            return "break"
+        return None
+
+    def _enter_run(self) -> None:
+        """Common setup for run/arun."""
+        self._ensure_agent_ready()
+        self._cancel_token = CancellationToken()
+        with self._state:
+            if self._state.execution_status in [
+                ConversationExecutionStatus.IDLE,
+                ConversationExecutionStatus.PAUSED,
+                ConversationExecutionStatus.ERROR,
+                ConversationExecutionStatus.STUCK,
+            ]:
+                self._state.execution_status = ConversationExecutionStatus.RUNNING
+
+    def _handle_run_error(self, error: Exception) -> None:
+        """Common error handling for run/arun (not CancelledError)."""
+        with self._state:
+            self._state.execution_status = ConversationExecutionStatus.ERROR
+            self._on_event(
+                ConversationErrorEvent(
+                    source="environment",
+                    code=error.__class__.__name__,
+                    detail=str(error),
+                )
+            )
+
     @observe(name="conversation.run")
     def run(self) -> None:
         """Runs the conversation until the agent finishes.
@@ -778,139 +882,34 @@ class LocalConversation(BaseConversation):
 
         Can be paused between steps
         """
-        # Ensure agent is fully initialized (loads plugins and initializes agent)
-        self._ensure_agent_ready()
-        self._cancel_token = CancellationToken()
-
-        with self._state:
-            if self._state.execution_status in [
-                ConversationExecutionStatus.IDLE,
-                ConversationExecutionStatus.PAUSED,
-                ConversationExecutionStatus.ERROR,
-                ConversationExecutionStatus.STUCK,
-            ]:
-                self._state.execution_status = ConversationExecutionStatus.RUNNING
+        self._enter_run()
 
         iteration = 0
         try:
             while True:
                 logger.debug(f"Conversation run iteration {iteration}")
                 with self._state:
-                    # Pause attempts to acquire the state lock
-                    # Before value can be modified step can be taken
-                    # Ensure step conditions are checked when lock is already acquired
-                    if self._state.execution_status in [
-                        ConversationExecutionStatus.PAUSED,
-                        ConversationExecutionStatus.STUCK,
-                    ]:
+                    directive = self._check_loop_state()
+                    if directive == "break":
                         break
-
-                    # Handle stop hooks on FINISHED
-                    if (
-                        self._state.execution_status
-                        == ConversationExecutionStatus.FINISHED
-                    ):
-                        if self._hook_processor is not None:
-                            should_stop, feedback = self._hook_processor.run_stop(
-                                reason="agent_finished"
-                            )
-                            if not should_stop:
-                                logger.info("Stop hook denied agent stopping")
-                                if feedback:
-                                    prefixed = f"[Stop hook feedback] {feedback}"
-                                    feedback_msg = MessageEvent(
-                                        source="environment",
-                                        llm_message=Message(
-                                            role="user",
-                                            content=[TextContent(text=prefixed)],
-                                        ),
-                                    )
-                                    self._on_event(feedback_msg)
-                                self._state.execution_status = (
-                                    ConversationExecutionStatus.RUNNING
-                                )
-                                continue
-                        # No hooks or hooks allowed stopping
-                        break
-
-                    # Check for stuck patterns if enabled
-                    if self._stuck_detector:
-                        is_stuck = self._stuck_detector.is_stuck()
-
-                        if is_stuck:
-                            logger.warning("Stuck pattern detected.")
-                            self._state.execution_status = (
-                                ConversationExecutionStatus.STUCK
-                            )
-                            continue
-
-                    # clear the flag before calling agent.step() (user approved)
-                    if (
-                        self._state.execution_status
-                        == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
-                    ):
-                        self._state.execution_status = (
-                            ConversationExecutionStatus.RUNNING
-                        )
+                    if directive == "continue":
+                        continue
 
                     self.agent.step(
-                        self, on_event=self._on_event, on_token=self._on_token
+                        self,
+                        on_event=self._on_event,
+                        on_token=self._on_token,
                     )
                     iteration += 1
 
-                    # Check for non-finished terminal conditions
-                    # Note: We intentionally do NOT check for FINISHED status here.
-                    # This allows concurrent user messages to be processed:
-                    # 1. Agent finishes and sets status to FINISHED
-                    # 2. User sends message concurrently via send_message()
-                    # 3. send_message() waits for FIFO lock, then sets status to IDLE
-                    # 4. Run loop continues to next iteration and processes the message
-                    # 5. Without this design, concurrent messages would be lost
-                    if (
-                        self.state.execution_status
-                        == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
-                    ):
-                        break
-
-                    if iteration >= self.max_iteration_per_run:
-                        # If the agent finished on this final iteration,
-                        # preserve the FINISHED status rather than
-                        # overwriting it with ERROR.
-                        if (
-                            self._state.execution_status
-                            == ConversationExecutionStatus.FINISHED
-                        ):
-                            break
-                        error_msg = (
-                            f"Agent reached maximum iterations limit "
-                            f"({self.max_iteration_per_run})."
-                        )
-                        logger.error(error_msg)
-                        self._state.execution_status = ConversationExecutionStatus.ERROR
-                        self._on_event(
-                            ConversationErrorEvent(
-                                source="environment",
-                                code="MaxIterationsReached",
-                                detail=error_msg,
-                            )
-                        )
+                    if self._check_post_step(iteration) == "break":
                         break
         except Exception as e:
-            with self._state:
-                self._state.execution_status = ConversationExecutionStatus.ERROR
-
-                # Add an error event
-                self._on_event(
-                    ConversationErrorEvent(
-                        source="environment",
-                        code=e.__class__.__name__,
-                        detail=str(e),
-                    )
-                )
-
-            # Re-raise with conversation id and persistence dir for better UX
+            self._handle_run_error(e)
             raise ConversationRunError(
-                self._state.id, e, persistence_dir=self._state.persistence_dir
+                self._state.id,
+                e,
+                persistence_dir=self._state.persistence_dir,
             ) from e
         finally:
             self._cancel_token = None
@@ -926,79 +925,20 @@ class LocalConversation(BaseConversation):
         :meth:`interrupt` can cancel it mid-LLM-call.  On
         ``CancelledError`` the conversation transitions to ``PAUSED``
         and emits an :class:`InterruptEvent`.
-
-        A fresh :class:`CancellationToken` is created per run so that
-        ``interrupt()`` can signal in-flight tool calls to abort.  After
-        ``CancelledError`` any ``ActionEvent`` without a matching
-        observation is patched with a synthetic ``AgentErrorEvent`` so
-        the LLM conversation history stays consistent.
         """
-        self._ensure_agent_ready()
+        self._enter_run()
         self._arun_task = asyncio.current_task()
-        self._cancel_token = CancellationToken()
-
-        with self._state:
-            if self._state.execution_status in [
-                ConversationExecutionStatus.IDLE,
-                ConversationExecutionStatus.PAUSED,
-                ConversationExecutionStatus.ERROR,
-                ConversationExecutionStatus.STUCK,
-            ]:
-                self._state.execution_status = ConversationExecutionStatus.RUNNING
 
         iteration = 0
         try:
             while True:
                 logger.debug(f"Conversation arun iteration {iteration}")
                 with self._state:
-                    if self._state.execution_status in [
-                        ConversationExecutionStatus.PAUSED,
-                        ConversationExecutionStatus.STUCK,
-                    ]:
+                    directive = self._check_loop_state()
+                    if directive == "break":
                         break
-
-                    if (
-                        self._state.execution_status
-                        == ConversationExecutionStatus.FINISHED
-                    ):
-                        if self._hook_processor is not None:
-                            should_stop, feedback = self._hook_processor.run_stop(
-                                reason="agent_finished"
-                            )
-                            if not should_stop:
-                                logger.info("Stop hook denied agent stopping")
-                                if feedback:
-                                    prefixed = f"[Stop hook feedback] {feedback}"
-                                    feedback_msg = MessageEvent(
-                                        source="environment",
-                                        llm_message=Message(
-                                            role="user",
-                                            content=[TextContent(text=prefixed)],
-                                        ),
-                                    )
-                                    self._on_event(feedback_msg)
-                                self._state.execution_status = (
-                                    ConversationExecutionStatus.RUNNING
-                                )
-                                continue
-                        break
-
-                    if self._stuck_detector:
-                        is_stuck = self._stuck_detector.is_stuck()
-                        if is_stuck:
-                            logger.warning("Stuck pattern detected.")
-                            self._state.execution_status = (
-                                ConversationExecutionStatus.STUCK
-                            )
-                            continue
-
-                    if (
-                        self._state.execution_status
-                        == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
-                    ):
-                        self._state.execution_status = (
-                            ConversationExecutionStatus.RUNNING
-                        )
+                    if directive == "continue":
+                        continue
 
                     await self.agent.astep(
                         self,
@@ -1007,62 +947,20 @@ class LocalConversation(BaseConversation):
                     )
                     iteration += 1
 
-                    if (
-                        self.state.execution_status
-                        == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
-                    ):
-                        break
-
-                    if iteration >= self.max_iteration_per_run:
-                        if (
-                            self._state.execution_status
-                            == ConversationExecutionStatus.FINISHED
-                        ):
-                            break
-                        error_msg = (
-                            f"Agent reached maximum iterations limit "
-                            f"({self.max_iteration_per_run})."
-                        )
-                        logger.error(error_msg)
-                        self._state.execution_status = ConversationExecutionStatus.ERROR
-                        self._on_event(
-                            ConversationErrorEvent(
-                                source="environment",
-                                code="MaxIterationsReached",
-                                detail=error_msg,
-                            )
-                        )
+                    if self._check_post_step(iteration) == "break":
                         break
         except asyncio.CancelledError:
-            # CancelledError is intentionally NOT re-raised.  ``interrupt()``
-            # uses ``asyncio.Task.cancel()`` to break out of ``arun()`` and
-            # expects the task to terminate cleanly.  Re-raising would
-            # propagate the cancellation to EventService/caller which would
-            # surface it as an unexpected error.  Instead we transition to
-            # PAUSED so the conversation can be resumed later.
             logger.info("arun() interrupted via task cancellation")
             with self._state:
-                # Emit synthetic error observations for any ActionEvents
-                # that were in-flight when the interrupt landed.  Without
-                # these the LLM history would contain tool-call requests
-                # with no tool-result, which causes provider errors on
-                # the next completion call.
                 self._emit_orphaned_action_errors()
-
                 self._state.execution_status = ConversationExecutionStatus.PAUSED
                 self._on_event(InterruptEvent())
         except Exception as e:
-            with self._state:
-                self._state.execution_status = ConversationExecutionStatus.ERROR
-                self._on_event(
-                    ConversationErrorEvent(
-                        source="environment",
-                        code=e.__class__.__name__,
-                        detail=str(e),
-                    )
-                )
+            self._handle_run_error(e)
             raise ConversationRunError(
-                self._state.id, e, persistence_dir=self._state.persistence_dir
+                self._state.id,
+                e,
+                persistence_dir=self._state.persistence_dir,
             ) from e
         finally:
             self._cancel_token = None

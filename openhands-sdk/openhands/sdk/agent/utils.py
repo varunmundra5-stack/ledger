@@ -467,6 +467,24 @@ def prepare_llm_messages(
 ) -> list[Message] | Condensation: ...
 
 
+def _finalize_messages(
+    condensation_result: View | Condensation,
+    llm_convertible_events: list[LLMConvertibleEvent],
+    additional_messages: list[Message] | None,
+) -> list[Message] | Condensation:
+    """Apply condenser result and build final message list (shared helper)."""
+    match condensation_result:
+        case View():
+            llm_convertible_events = condensation_result.events
+        case Condensation():
+            return condensation_result
+
+    messages = LLMConvertibleEvent.events_to_messages(llm_convertible_events)
+    if additional_messages:
+        messages.extend(additional_messages)
+    return messages
+
+
 def prepare_llm_messages(
     events: Sequence[Event],
     condenser: CondenserBase | None = None,
@@ -493,31 +511,20 @@ def prepare_llm_messages(
     Raises:
         RuntimeError: If condensation is needed but no callback is provided
     """
-
     view = View.from_events(events)
     llm_convertible_events: list[LLMConvertibleEvent] = view.events
 
-    # If a condenser is registered, we need to give it an
-    # opportunity to transform the events. This will either
-    # produce a list of events, exactly as expected, or a
-    # new condensation that needs to be processed
     if condenser is not None:
-        condensation_result = condenser.condense(view, agent_llm=llm)
+        result = condenser.condense(view, agent_llm=llm)
+        return _finalize_messages(
+            result,
+            llm_convertible_events,
+            additional_messages,
+        )
 
-        match condensation_result:
-            case View():
-                llm_convertible_events = condensation_result.events
-
-            case Condensation():
-                return condensation_result
-
-    # Convert events to messages
     messages = LLMConvertibleEvent.events_to_messages(llm_convertible_events)
-
-    # Add any additional messages (e.g., user question for ask_agent)
     if additional_messages:
         messages.extend(additional_messages)
-
     return messages
 
 
@@ -559,13 +566,12 @@ def make_llm_completion(
             add_security_risk_prediction=True,
             on_token=on_token,
         )
-    else:
-        return llm.completion(
-            messages=messages,
-            tools=tools or [],
-            add_security_risk_prediction=True,
-            on_token=on_token,
-        )
+    return llm.completion(
+        messages=messages,
+        tools=tools or [],
+        add_security_risk_prediction=True,
+        on_token=on_token,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,19 +594,16 @@ async def aprepare_llm_messages(
     llm_convertible_events: list[LLMConvertibleEvent] = view.events
 
     if condenser is not None:
-        condensation_result = await condenser.acondense(view, agent_llm=llm)
-
-        match condensation_result:
-            case View():
-                llm_convertible_events = condensation_result.events
-            case Condensation():
-                return condensation_result
+        result = await condenser.acondense(view, agent_llm=llm)
+        return _finalize_messages(
+            result,
+            llm_convertible_events,
+            additional_messages,
+        )
 
     messages = LLMConvertibleEvent.events_to_messages(llm_convertible_events)
-
     if additional_messages:
         messages.extend(additional_messages)
-
     return messages
 
 
@@ -620,10 +623,9 @@ async def amake_llm_completion(
             add_security_risk_prediction=True,
             on_token=on_token,
         )
-    else:
-        return await llm.acompletion(
-            messages=messages,
-            tools=tools or [],
-            add_security_risk_prediction=True,
-            on_token=on_token,
-        )
+    return await llm.acompletion(
+        messages=messages,
+        tools=tools or [],
+        add_security_risk_prediction=True,
+        on_token=on_token,
+    )

@@ -17,7 +17,7 @@ from openhands.sdk.context.prompts import render_template
 from openhands.sdk.context.view import View
 from openhands.sdk.event.base import LLMConvertibleEvent
 from openhands.sdk.event.condenser import Condensation
-from openhands.sdk.llm import LLM, Message, TextContent
+from openhands.sdk.llm import LLM, LLMResponse, Message, TextContent
 from openhands.sdk.logger import get_logger
 from openhands.sdk.observability.laminar import observe
 from openhands.sdk.utils import maybe_truncate
@@ -138,33 +138,20 @@ class LLMSummarizingCondenser(RollingCondenser):
         if Reason.REQUEST in reasons:
             return CondensationRequirement.HARD
 
-    def _generate_condensation(
+    def _build_condensation_prompt(
         self,
         forgotten_events: Sequence[LLMConvertibleEvent],
-        summary_offset: int,
         max_event_str_length: int | None = None,
-    ) -> Condensation:
-        """Generate a condensation by using the condenser's LLM to summarize forgotten
-        events.
-
-        Args:
-            forgotten_events: The list of events to be summarized.
-            summary_offset: The index where the summary event should be inserted.
-            max_event_str_length: Optional maximum length for each event string. If
-                provided, event strings longer than this will be truncated.
-
-        Returns:
-            Condensation: The generated condensation object.
-
-        Raises:
-            ValueError: If forgotten_events is empty (0 events to condense).
-        """
+    ) -> list[Message]:
+        """Build the summarization prompt messages (shared by sync/async)."""
         assert len(forgotten_events) > 0, "No events to condense."
 
-        # Convert events to strings for the template
         event_strings = [
-            maybe_truncate(str(forgotten_event), truncate_after=max_event_str_length)
-            for forgotten_event in forgotten_events
+            maybe_truncate(
+                str(fe),
+                truncate_after=max_event_str_length,
+            )
+            for fe in forgotten_events
         ]
 
         prompt = render_template(
@@ -172,15 +159,15 @@ class LLMSummarizingCondenser(RollingCondenser):
             "summarizing_prompt.j2",
             events=event_strings,
         )
+        return [Message(role="user", content=[TextContent(text=prompt)])]
 
-        messages = [Message(role="user", content=[TextContent(text=prompt)])]
-
-        # Do not pass extra_body explicitly. The LLM handles forwarding
-        # litellm_extra_body only when it is non-empty.
-        llm_response = self.llm.completion(
-            messages=messages,
-        )
-        # Extract summary from the LLMResponse message
+    @staticmethod
+    def _condensation_from_response(
+        llm_response: LLMResponse,
+        forgotten_events: Sequence[LLMConvertibleEvent],
+        summary_offset: int,
+    ) -> Condensation:
+        """Extract summary and build Condensation (shared by sync/async)."""
         summary = None
         if llm_response.message.content:
             first_content = llm_response.message.content[0]
@@ -188,10 +175,28 @@ class LLMSummarizingCondenser(RollingCondenser):
                 summary = first_content.text
 
         return Condensation(
-            forgotten_event_ids={event.id for event in forgotten_events},
+            forgotten_event_ids={e.id for e in forgotten_events},
             summary=summary,
             summary_offset=summary_offset,
             llm_response_id=llm_response.id,
+        )
+
+    def _generate_condensation(
+        self,
+        forgotten_events: Sequence[LLMConvertibleEvent],
+        summary_offset: int,
+        max_event_str_length: int | None = None,
+    ) -> Condensation:
+        """Generate a condensation using the condenser's LLM."""
+        messages = self._build_condensation_prompt(
+            forgotten_events,
+            max_event_str_length,
+        )
+        llm_response = self.llm.completion(messages=messages)
+        return self._condensation_from_response(
+            llm_response,
+            forgotten_events,
+            summary_offset,
         )
 
     def _get_forgotten_events(
@@ -309,31 +314,9 @@ class LLMSummarizingCondenser(RollingCondenser):
     def get_condensation(
         self, view: View, agent_llm: LLM | None = None
     ) -> Condensation:
-        # The condensation is dependent on the events we want to drop and the previous
-        # summary. If we fail to find an appropriate set of events to forget raise an
-        # exception so the conversation can keep going until conditions change.
-        try:
-            forgotten_events, summary_offset = self._get_forgotten_events(
-                view, agent_llm=agent_llm
-            )
-        except ValueError as e:
-            raise NoCondensationAvailableException(
-                "Unable to compute forgotten events"
-            ) from e
-
-        if not forgotten_events:
-            raise NoCondensationAvailableException(
-                "Cannot condense 0 events. This typically occurs when a tool loop "
-                "spans almost the entire view, leaving no valid range for forgetting "
-                "events. Consider adjusting keep_first or max_size parameters."
-            )
-
-        if len(forgotten_events) < len(view) * self.minimum_progress:
-            raise NoCondensationAvailableException(
-                "Cannot apply condensation: events forgotten below minimum progress "
-                "threshold."
-            )
-
+        forgotten_events, summary_offset = self._validate_forgotten_events(
+            view, agent_llm
+        )
         return self._generate_condensation(
             forgotten_events=forgotten_events,
             summary_offset=summary_offset,
@@ -350,39 +333,23 @@ class LLMSummarizingCondenser(RollingCondenser):
         max_event_str_length: int | None = None,
     ) -> Condensation:
         """Async variant of :meth:`_generate_condensation`."""
-        assert len(forgotten_events) > 0, "No events to condense."
-
-        event_strings = [
-            maybe_truncate(str(fe), truncate_after=max_event_str_length)
-            for fe in forgotten_events
-        ]
-
-        prompt = render_template(
-            os.path.join(os.path.dirname(__file__), "prompts"),
-            "summarizing_prompt.j2",
-            events=event_strings,
+        messages = self._build_condensation_prompt(
+            forgotten_events,
+            max_event_str_length,
         )
-
-        messages = [Message(role="user", content=[TextContent(text=prompt)])]
         llm_response = await self.llm.acompletion(messages=messages)
-
-        summary = None
-        if llm_response.message.content:
-            first_content = llm_response.message.content[0]
-            if isinstance(first_content, TextContent):
-                summary = first_content.text
-
-        return Condensation(
-            forgotten_event_ids={event.id for event in forgotten_events},
-            summary=summary,
-            summary_offset=summary_offset,
-            llm_response_id=llm_response.id,
+        return self._condensation_from_response(
+            llm_response,
+            forgotten_events,
+            summary_offset,
         )
 
-    async def aget_condensation(
-        self, view: View, agent_llm: LLM | None = None
-    ) -> Condensation:
-        """Async variant of :meth:`get_condensation`."""
+    def _validate_forgotten_events(
+        self,
+        view: View,
+        agent_llm: LLM | None = None,
+    ) -> tuple[Sequence[LLMConvertibleEvent], int]:
+        """Shared validation for get_condensation / aget_condensation."""
         try:
             forgotten_events, summary_offset = self._get_forgotten_events(
                 view, agent_llm=agent_llm
@@ -394,18 +361,27 @@ class LLMSummarizingCondenser(RollingCondenser):
 
         if not forgotten_events:
             raise NoCondensationAvailableException(
-                "Cannot condense 0 events. This typically occurs when a tool loop "
-                "spans almost the entire view, leaving no valid range for "
-                "forgetting events. Consider adjusting keep_first or max_size "
-                "parameters."
+                "Cannot condense 0 events. This typically occurs "
+                "when a tool loop spans almost the entire view, "
+                "leaving no valid range for forgetting events. "
+                "Consider adjusting keep_first or max_size."
             )
 
         if len(forgotten_events) < len(view) * self.minimum_progress:
             raise NoCondensationAvailableException(
-                "Cannot apply condensation: events forgotten below minimum "
-                "progress threshold."
+                "Cannot apply condensation: events forgotten "
+                "below minimum progress threshold."
             )
 
+        return forgotten_events, summary_offset
+
+    async def aget_condensation(
+        self, view: View, agent_llm: LLM | None = None
+    ) -> Condensation:
+        """Async variant of :meth:`get_condensation`."""
+        forgotten_events, summary_offset = self._validate_forgotten_events(
+            view, agent_llm
+        )
         return await self._agenerate_condensation(
             forgotten_events=forgotten_events,
             summary_offset=summary_offset,
@@ -436,7 +412,8 @@ class LLMSummarizingCondenser(RollingCondenser):
                 )
                 logger.warning(
                     f"Hard context reset summarization failed: {e}. "
-                    f"Reducing max event size to {max_event_str_length}."
+                    f"Reducing max event size to "
+                    f"{max_event_str_length}."
                 )
             attempts_remaining -= 1
 
