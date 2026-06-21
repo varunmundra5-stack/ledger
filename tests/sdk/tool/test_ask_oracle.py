@@ -7,7 +7,13 @@ from pydantic import PrivateAttr, ValidationError
 
 from openhands.sdk import LLM, LocalConversation, OpenHandsAgentSettings, Tool
 from openhands.sdk.agent import Agent
-from openhands.sdk.llm import Message, TextContent, llm_profile_store
+from openhands.sdk.llm import (
+    LLMResponse,
+    Message,
+    TextContent,
+    TokenCallbackType,
+    llm_profile_store,
+)
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.testing import TestLLM
 from openhands.sdk.tool import ToolDefinition
@@ -34,17 +40,15 @@ class CapturingTestLLM(TestLLM):
         self,
         messages: list[Message],
         tools: Sequence[ToolDefinition] | None = None,
-        _return_metrics: bool = False,
         add_security_risk_prediction: bool = False,
-        on_token: Any = None,
+        on_token: TokenCallbackType | None = None,
         **kwargs: Any,
-    ):
+    ) -> LLMResponse:
         self._last_messages = list(messages)
         self._last_tools = tools
         return super().completion(
             messages=messages,
             tools=tools,
-            _return_metrics=_return_metrics,
             add_security_risk_prediction=add_security_risk_prediction,
             on_token=on_token,
             **kwargs,
