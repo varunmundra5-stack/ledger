@@ -344,6 +344,7 @@ class TestLoadAllSkills:
             assert result.sources["sandbox"] == 0
             assert result.sources["org"] == 0
             assert result.sources["project"] == 0
+            assert result.sources["registered_marketplaces"] == 0
 
     def test_load_all_skills_passes_marketplace_path_to_sdk_base(self):
         """Test that marketplace_path is forwarded to SDK public skill loading."""
