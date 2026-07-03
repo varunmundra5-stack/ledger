@@ -50,7 +50,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.tool import Tool
-from openhands.sdk.utils.cipher import Cipher
+from openhands.sdk.utils.cipher import FERNET_TOKEN_PREFIX, Cipher
 from openhands.sdk.utils.deprecation import warn_deprecated
 from openhands.sdk.utils.pydantic_secrets import (
     MissingCipherError,
@@ -179,6 +179,100 @@ def serialize_mcp_config(
         )
 
     return sanitize_dict(dumped)
+
+
+def _encrypt_secret_str_or_keep(cipher: Cipher, value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if (
+        value.startswith(FERNET_TOKEN_PREFIX)
+        and cipher.try_decrypt_str(value) is not None
+    ):
+        return value
+    return cast(str, cipher.encrypt(SecretStr(value)))
+
+
+def _transform_mapping_secret_values(
+    mapping: Any, transform: Callable[[Any], Any]
+) -> None:
+    if not isinstance(mapping, dict):
+        return
+    for key, value in list(mapping.items()):
+        if isinstance(value, str):
+            mapping[key] = transform(value)
+
+
+def _transform_agent_settings_secret_values(
+    payload: Mapping[str, Any], transform: Callable[[Any], Any]
+) -> dict[str, Any]:
+    from openhands.sdk.llm.llm import LLM_SECRET_FIELDS
+
+    updated = copy.deepcopy(dict(payload))
+
+    llm = updated.get("llm")
+    if isinstance(llm, dict):
+        for key in LLM_SECRET_FIELDS:
+            if key in llm:
+                llm[key] = transform(llm[key])
+
+    verification = updated.get("verification")
+    if isinstance(verification, dict) and "critic_api_key" in verification:
+        verification["critic_api_key"] = transform(verification["critic_api_key"])
+
+    agent_context = updated.get("agent_context")
+    if isinstance(agent_context, dict):
+        _transform_mapping_secret_values(agent_context.get("secrets"), transform)
+
+    mcp_config = updated.get("mcp_config")
+    if isinstance(mcp_config, dict):
+        updated["mcp_config"] = _walk_mcp_secret_values(mcp_config, transform)
+
+    return updated
+
+
+def encrypt_agent_settings_secret_values(
+    payload: Mapping[str, Any], *, cipher: Cipher
+) -> dict[str, Any]:
+    """Encrypt secret leaves in a full or sparse agent-settings payload.
+
+    This is for storage adapters and database migrations that need to rewrite
+    persisted payloads without expanding sparse settings diffs into full settings.
+    """
+    return _transform_agent_settings_secret_values(
+        payload, lambda value: _encrypt_secret_str_or_keep(cipher, value)
+    )
+
+
+def decrypt_agent_settings_secret_values(
+    payload: Mapping[str, Any], *, cipher: Cipher
+) -> dict[str, Any]:
+    """Decrypt secret leaves in a full or sparse agent-settings payload."""
+    return _transform_agent_settings_secret_values(
+        payload, lambda value: decrypt_str_with_cipher_or_keep(cipher, value)
+    )
+
+
+def load_agent_settings_from_storage(
+    payload: Any, *, cipher: Cipher
+) -> OpenHandsAgentSettings | ACPAgentSettings:
+    """Validate a persisted agent-settings payload with secret decryption."""
+    return validate_agent_settings(payload, context={"cipher": cipher})
+
+
+def dump_agent_settings_for_storage(
+    settings: OpenHandsAgentSettings | ACPAgentSettings,
+    *,
+    cipher: Cipher,
+    exclude: Any = None,
+    exclude_unset: bool = False,
+) -> dict[str, Any]:
+    """Serialize agent settings with SDK-owned encrypted secret handling."""
+    return settings.model_dump(
+        mode="json",
+        context={"cipher": cipher, "expose_secrets": "encrypted"},
+        exclude=exclude,
+        exclude_unset=exclude_unset,
+    )
 
 
 SettingsValueType = Literal[
