@@ -45,6 +45,7 @@ from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
 )
+from openhands.sdk.conversation.types import TraceMetadataValue
 from openhands.sdk.event import (
     AgentErrorEvent,
     ObservationBaseEvent,
@@ -1361,6 +1362,13 @@ class EventService:
             raise ValueError("inactive_service")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.update_secrets, secrets)
+
+    async def update_observability_metadata(
+        self, metadata: dict[str, TraceMetadataValue]
+    ) -> None:
+        """Augment the active conversation trace metadata."""
+        conversation = self.get_conversation()
+        conversation.update_observability_metadata(metadata)
 
     async def set_confirmation_policy(self, policy: ConfirmationPolicyBase):
         """Set the confirmation policy for the conversation."""

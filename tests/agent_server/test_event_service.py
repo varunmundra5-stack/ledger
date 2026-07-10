@@ -81,6 +81,17 @@ def event_service(sample_stored_conversation):
     return service
 
 
+@pytest.mark.asyncio
+async def test_update_observability_metadata(event_service):
+    conversation = MagicMock(spec=LocalConversation)
+    event_service._conversation = conversation
+    metadata = {"final_snapshot_captured": True, "byte_count": 42}
+
+    await event_service.update_observability_metadata(metadata)
+
+    conversation.update_observability_metadata.assert_called_once_with(metadata)
+
+
 @pytest.fixture
 def mock_conversation_with_events():
     """Create a mock conversation with sample events."""

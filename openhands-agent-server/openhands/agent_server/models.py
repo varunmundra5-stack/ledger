@@ -20,7 +20,10 @@ from openhands.sdk.conversation.request import (  # re-export for backward compa
 )
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import ConversationExecutionStatus
-from openhands.sdk.conversation.types import ConversationTags
+from openhands.sdk.conversation.types import (
+    ConversationObservabilityMetadata,
+    ConversationTags,
+)
 from openhands.sdk.event.base import Event
 from openhands.sdk.hooks import HookConfig
 from openhands.sdk.llm.message import (  # re-export
@@ -480,6 +483,12 @@ class UpdateConversationRequest(BaseModel):
             "Replaces all existing tags when provided."
         ),
     )
+
+
+class UpdateObservabilityMetadataRequest(BaseModel):
+    """Payload to augment conversation trace metadata."""
+
+    metadata: ConversationObservabilityMetadata
 
 
 class ForkConversationRequest(BaseModel):

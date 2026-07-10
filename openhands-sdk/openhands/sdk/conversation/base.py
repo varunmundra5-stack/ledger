@@ -197,6 +197,12 @@ class BaseConversation(ABC):
             return
         update_root_span_metadata(self._observability_root_span, metadata)
 
+    def update_observability_metadata(
+        self, metadata: dict[str, TraceMetadataValue]
+    ) -> None:
+        """Augment the conversation trace metadata."""
+        self._update_observability_metadata(metadata)
+
     @property
     @abstractmethod
     def id(self) -> ConversationID: ...

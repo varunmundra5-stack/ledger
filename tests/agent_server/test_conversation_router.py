@@ -1042,6 +1042,65 @@ def test_delete_conversation_failure(
         client.app.dependency_overrides.clear()
 
 
+def test_update_observability_metadata(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/observability/metadata",
+            json={"metadata": {"final_snapshot_captured": True, "byte_count": 42}},
+        )
+
+        assert response.status_code == 200
+        mock_event_service.update_observability_metadata.assert_awaited_once_with(
+            {"final_snapshot_captured": True, "byte_count": 42}
+        )
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_update_observability_metadata_not_found(
+    client, mock_conversation_service, sample_conversation_id
+):
+    mock_conversation_service.get_event_service.return_value = None
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/observability/metadata",
+            json={"metadata": {"final_snapshot_captured": True}},
+        )
+
+        assert response.status_code == 404
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_update_observability_metadata_rejects_nested_values(
+    client, mock_conversation_service, sample_conversation_id
+):
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/observability/metadata",
+            json={"metadata": {"packages": {"pytest": "9.0.0"}}},
+        )
+
+        assert response.status_code == 422
+    finally:
+        client.app.dependency_overrides.clear()
+
+
 def test_run_conversation_success(
     client, mock_conversation_service, mock_event_service, sample_conversation_id
 ):

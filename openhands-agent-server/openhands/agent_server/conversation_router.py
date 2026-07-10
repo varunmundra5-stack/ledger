@@ -38,6 +38,7 @@ from openhands.agent_server.models import (
     StartGoalRequest,
     Success,
     UpdateConversationRequest,
+    UpdateObservabilityMetadataRequest,
     UpdateSecretsRequest,
     trim_conversation_response_skills,
 )
@@ -271,6 +272,26 @@ async def delete_conversation(
     deleted = await conversation_service.delete_conversation(conversation_id)
     if not deleted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST)
+    return Success()
+
+
+@conversation_router.post(
+    "/{conversation_id}/observability/metadata",
+    responses={404: {"description": "Item not found"}},
+)
+async def update_observability_metadata(
+    conversation_id: UUID,
+    request: UpdateObservabilityMetadataRequest,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> Success:
+    """Augment trace metadata for an active conversation."""
+    event_service = await conversation_service.get_event_service(conversation_id)
+    if event_service is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    try:
+        await event_service.update_observability_metadata(request.metadata)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     return Success()
 
 
