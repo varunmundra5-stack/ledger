@@ -215,7 +215,7 @@ def test_switch_acp_model_disarms_discarded_agent_finalizer(tmp_path):
     live_executor = old_agent._executor
     lifecycle = MagicMock()
     lifecycle.path = tmp_path / "auth.json"
-    lifecycle.authenticated = True
+    lifecycle.may_have_changed = True
     old_agent._file_credential_lifecycles["CODEX_AUTH_JSON"] = lifecycle
     credential_lock = old_agent._file_credential_lock
 
