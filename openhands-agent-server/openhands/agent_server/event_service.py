@@ -8,7 +8,6 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
-from openhands.agent_server.codex_auth import CODEX_AUTH_SECRET_NAME, CodexAuthBroker
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
     ConversationLease,
@@ -23,6 +22,7 @@ from openhands.agent_server.models import (
 from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.sdk import LLM, AgentBase, Event, Message, TextContent, get_logger
 from openhands.sdk.agent import ACPAgent
+from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
 from openhands.sdk.conversation.base import BaseConversation
 from openhands.sdk.conversation.events_list_base import EventsListBase
 from openhands.sdk.conversation.goal import (
@@ -46,6 +46,7 @@ from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
 )
+from openhands.sdk.credential import VersionedCredentialBinding
 from openhands.sdk.event import (
     AgentErrorEvent,
     ObservationBaseEvent,
@@ -57,7 +58,6 @@ from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.llm.streaming import LLMStreamChunk
 from openhands.sdk.mcp.utils import MCPToolProvider
-from openhands.sdk.secret import LookupSecret
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
@@ -85,7 +85,9 @@ class EventService:
     conversations_dir: Path
     cipher: Cipher | None = None
     mcp_tool_provider: MCPToolProvider | None = None
-    codex_auth_broker: CodexAuthBroker | None = None
+    credential_bindings: dict[str, VersionedCredentialBinding] = field(
+        default_factory=dict
+    )
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
     _conversation: LocalConversation | None = field(default=None, init=False)
@@ -119,13 +121,6 @@ class EventService:
     @property
     def conversation_dir(self):
         return self.conversations_dir / self.stored.id.hex
-
-    def _broker_codex_auth_source(
-        self, source: SecretValue | None
-    ) -> SecretValue | None:
-        if self.codex_auth_broker is None or not isinstance(source, LookupSecret):
-            return source
-        return self.codex_auth_broker.ensure_brokered_source(self.stored.id, source)
 
     async def load_meta(self):
         meta_file = self.conversation_dir / "meta.json"
@@ -855,12 +850,12 @@ class EventService:
         conversation.set_confirmation_policy(self.stored.confirmation_policy)
         conversation.set_security_analyzer(self.stored.security_analyzer)
         self._conversation = conversation
-        registry = self._conversation.state.secret_registry
-        source = registry.secret_sources.get(CODEX_AUTH_SECRET_NAME)
-        brokered_source = self._broker_codex_auth_source(source)
-        if brokered_source is not source:
-            assert brokered_source is not None
-            registry.update_secrets({CODEX_AUTH_SECRET_NAME: brokered_source})
+        if isinstance(conversation.agent, ACPAgent):
+            for secret_name, binding in self.credential_bindings.items():
+                conversation.agent.activate_file_credential_binding(
+                    secret_name,
+                    binding,
+                )
         self._conversation._state.set_write_guard(self._write_guard)
         if not self._external_lease_renewal:
             self._lease_task = asyncio.create_task(self._renew_lease_loop())
@@ -1375,11 +1370,9 @@ class EventService:
         """Update secrets in the conversation."""
         if not self._conversation:
             raise ValueError("inactive_service")
-        source = secrets.get(CODEX_AUTH_SECRET_NAME)
-        brokered_source = self._broker_codex_auth_source(source)
-        if brokered_source is not source:
-            assert brokered_source is not None
-            secrets = {**secrets, CODEX_AUTH_SECRET_NAME: brokered_source}
+        if CODEX_AUTH_SECRET_NAME in self.credential_bindings:
+            secrets = dict(secrets)
+            secrets.pop(CODEX_AUTH_SECRET_NAME, None)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.update_secrets, secrets)
 
@@ -1485,6 +1478,7 @@ class EventService:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._conversation.close)
             self._conversation = None
+        self.credential_bindings = {}
 
         if self._lease is not None and self._lease_generation is not None:
             self._lease.release(self._lease_generation)

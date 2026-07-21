@@ -63,6 +63,7 @@ from openhands.sdk.agent.acp_file_credentials import (
     ACPFileCredentialLifecycle,
     ACPFileCredentialNeedsReauthError,
     ACPFileCredentialSyncError,
+    codex_auth_file,
     codex_auth_file_is_chatgpt,
     create_file_credential_lifecycle,
     write_secret_file,
@@ -71,6 +72,7 @@ from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
 from openhands.sdk.conversation.state import ConversationExecutionStatus
+from openhands.sdk.credential import CredentialSyncError, VersionedCredentialBinding
 from openhands.sdk.event import (
     ACPToolCallEvent,
     ActionEvent,
@@ -101,6 +103,10 @@ from openhands.sdk.utils.redact import redact_text_secrets
 
 
 logger = get_logger(__name__)
+
+_codex_auth_file = codex_auth_file
+_codex_auth_file_is_chatgpt = codex_auth_file_is_chatgpt
+_write_secret_file = write_secret_file
 maybe_init_laminar()
 
 
@@ -1169,6 +1175,8 @@ class _OpenHandsACPBridge:
             if self.before_mask is not None:
                 self.before_mask()
             return _mask_json_value(value, self.mask)
+        except CredentialSyncError:
+            raise
         except Exception:
             logger.debug("secret masking failed", exc_info=True)
             return value
@@ -1698,12 +1706,27 @@ class ACPAgent(AgentBase):
     _file_credential_lifecycles: dict[str, ACPFileCredentialLifecycle] = PrivateAttr(
         default_factory=dict
     )
+    _file_credential_bindings: dict[str, VersionedCredentialBinding] = PrivateAttr(
+        default_factory=dict
+    )
     _file_credential_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _file_credential_close_lock: threading.Lock = PrivateAttr(
         default_factory=threading.Lock
     )
 
     # -- Helpers -----------------------------------------------------------
+
+    def activate_file_credential_binding(
+        self,
+        secret_name: str,
+        binding: VersionedCredentialBinding,
+    ) -> None:
+        with self._file_credential_lock:
+            if self._initialized or self._closed:
+                raise RuntimeError(
+                    "ACP credential bindings must be activated before use"
+                )
+            self._file_credential_bindings[secret_name] = binding
 
     def _record_usage(
         self,
@@ -1973,15 +1996,8 @@ class ACPAgent(AgentBase):
             self._start_acp_server(state)
         except Exception as e:
             logger.error("Failed to start ACP server: %s", e)
-            self._track_file_credentials_for_masking()
-            sync_failures = self._sync_file_credentials_collect(changed_only=True)
-            self._log_file_credential_failures("sync", sync_failures)
-            release_failures = self._release_file_credentials_collect(
-                exclude=set(sync_failures)
-            )
-            self._log_file_credential_failures("release", release_failures)
             try:
-                self._cleanup()
+                self.close()
             except Exception:
                 logger.warning("Failed to clean up ACP resources", exc_info=True)
             # init_state runs *outside* run()/arun()'s try-block (it is reached
@@ -2239,75 +2255,42 @@ class ACPAgent(AgentBase):
     ) -> None:
         for spec in self.acp_file_secrets:
             name = spec.secret_name
-            source = state.secret_registry.secret_sources.get(name)
+            binding = self._file_credential_bindings.get(name)
+            assert self._executor is not None
+            lifecycle = create_file_credential_lifecycle(
+                name,
+                binding,
+                self._executor.run_async,
+            )
+            if lifecycle is not None:
+                with self._file_credential_lock:
+                    if self._closed:
+                        raise CredentialSyncError("Credential binding is closed.")
+                    self._file_credential_lifecycles[name] = lifecycle
+                lifecycle.materialize(state.secret_registry, env)
+                continue
+
+            value = state.secret_registry.get_secret_value(name)
+            if not value:
+                continue
             directory = self._acp_file_secret_dir(state, spec.subdir)
             target = directory / spec.filename
-            lifecycle = create_file_credential_lifecycle(name, source)
-            if lifecycle is not None:
-                try:
-                    value = lifecycle.load()
-                except BaseException:
-                    release_lifecycle = False
-                    with self._file_credential_lock:
-                        if not self._closed:
-                            self._file_credential_lifecycles[name] = lifecycle
-                        else:
-                            release_lifecycle = True
-                    if release_lifecycle:
-                        try:
-                            lifecycle.release()
-                        except Exception:
-                            logger.warning(
-                                "Failed to release ACP file credential %r",
-                                name,
-                                exc_info=True,
-                            )
-                    raise
-            else:
-                value = state.secret_registry.get_secret_value(name)
-            release_lifecycle = False
-            with self._file_credential_lock:
-                if lifecycle is not None:
-                    if self._closed or not value:
-                        release_lifecycle = True
-                    else:
-                        self._file_credential_lifecycles[name] = lifecycle
-                if value and not self._closed:
-                    self._materialise_file_secret_locked(
-                        spec, state, env, directory, target, lifecycle, value
-                    )
-            if release_lifecycle:
-                assert lifecycle is not None
-                try:
-                    lifecycle.release()
-                except BaseException:
-                    with self._file_credential_lock:
-                        if not self._closed:
-                            self._file_credential_lifecycles[name] = lifecycle
-                    raise
+            self._materialise_file_secret(spec, env, directory, target, value)
 
-    def _materialise_file_secret_locked(
+    def _materialise_file_secret(
         self,
         spec: ACPFileSecretSpec,
-        state: ConversationState,
         env: dict[str, str],
         directory: Path,
         target: Path,
-        lifecycle: ACPFileCredentialLifecycle | None,
         value: str,
     ) -> None:
         name = spec.secret_name
-        if lifecycle is not None:
-            lifecycle.bind(target, state.secret_registry, value, env)
         try:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             directory.chmod(0o700)
             directory.parent.chmod(0o700)
             preserve_existing = target.is_file() and target.stat().st_size > 0
-            if lifecycle is not None:
-                preserve_existing = (
-                    preserve_existing and lifecycle.should_preserve_existing(target)
-                )
             if preserve_existing:
                 target.chmod(0o600)
                 logger.info(
@@ -2319,9 +2302,6 @@ class ACPAgent(AgentBase):
             else:
                 write_secret_file(target, value)
                 logger.info("Materialised ACP file-secret %r -> %s", name, target)
-            local_value = (
-                target.read_text(encoding="utf-8") if lifecycle is not None else None
-            )
         except (OSError, UnicodeError):
             logger.exception(
                 "Failed to materialise ACP file-secret %r under %s",
@@ -2330,9 +2310,6 @@ class ACPAgent(AgentBase):
             )
             raise
         env[spec.env_var] = str(directory if spec.env_points_to == "dir" else target)
-        if lifecycle is not None:
-            assert local_value is not None
-            lifecycle.record_materialized(value, local_value)
         for companion in spec.warn_if_unset:
             if not env.get(companion):
                 logger.warning(
@@ -2366,22 +2343,18 @@ class ACPAgent(AgentBase):
         ACPAgent._log_file_credential_failures(operation, remaining)
         raise first_error
 
-    def _sync_file_credentials_collect(
-        self, *, changed_only: bool = False
-    ) -> dict[str, Exception]:
+    def _sync_file_credentials_collect(self) -> dict[str, Exception]:
         failures: dict[str, Exception] = {}
         with self._file_credential_lock:
             for name, lifecycle in self._file_credential_lifecycles.items():
                 try:
-                    if changed_only and not lifecycle.may_have_changed:
-                        continue
-                    lifecycle.sync()
+                    lifecycle.flush()
                 except Exception as error:
                     failures[name] = error
         return failures
 
     def _sync_file_credentials(self) -> None:
-        """Persist brokered ACP file credentials."""
+        """Flush ACP file credentials."""
         failures = self._sync_file_credentials_collect()
         self._raise_first_file_credential_failure("sync", failures)
 
@@ -2390,72 +2363,35 @@ class ACPAgent(AgentBase):
             for name, lifecycle in self._file_credential_lifecycles.items():
                 try:
                     lifecycle.track_current()
-                except Exception:
-                    logger.debug(
-                        "Failed to track ACP file credential %r", name, exc_info=True
-                    )
+                except Exception as error:
+                    raise CredentialSyncError(
+                        f"ACP file credential {name!r} could not be synchronized."
+                    ) from error
 
-    async def _sync_file_credentials_best_effort(
-        self, *, changed_only: bool = False
-    ) -> None:
+    async def _flush_file_credentials(self, **_: object) -> None:
         with self._file_credential_lock:
             if not self._file_credential_lifecycles:
                 return
-        try:
-            await asyncio.to_thread(
-                self._sync_file_credentials_best_effort_blocking,
-                changed_only=changed_only,
-            )
-        except Exception:
-            logger.warning("Failed to sync ACP file credentials", exc_info=True)
+        await asyncio.to_thread(self._sync_file_credentials)
 
-    def _sync_file_credentials_best_effort_blocking(
-        self, *, changed_only: bool = False
-    ) -> None:
-        failures = self._sync_file_credentials_collect(changed_only=changed_only)
-        self._log_file_credential_failures("sync", failures)
+    def _flush_file_credentials_blocking(self, **_: object) -> None:
+        self._sync_file_credentials()
 
-    def _release_file_credentials_collect(
-        self, *, exclude: set[str] | None = None
-    ) -> dict[str, Exception]:
+    def _release_file_credentials_collect(self) -> dict[str, Exception]:
         failures: dict[str, Exception] = {}
-        excluded = exclude or set()
         with self._file_credential_lock:
             for name, lifecycle in list(self._file_credential_lifecycles.items()):
-                if name in excluded:
-                    continue
                 try:
-                    lifecycle.release()
+                    lifecycle.close()
                 except Exception as error:
                     failures[name] = error
-                else:
-                    self._file_credential_lifecycles.pop(name, None)
+                self._file_credential_lifecycles.pop(name, None)
         return failures
 
     def _release_file_credentials(self) -> None:
         """Release scoped ACP file credential sources."""
         failures = self._release_file_credentials_collect()
         self._raise_first_file_credential_failure("release", failures)
-
-    def _notify_file_credentials_auth_succeeded(self, method_id: str) -> None:
-        failures: dict[str, Exception] = {}
-        with self._file_credential_lock:
-            for name, lifecycle in self._file_credential_lifecycles.items():
-                try:
-                    lifecycle.on_auth_succeeded(method_id)
-                except Exception as error:
-                    failures[name] = error
-        self._raise_first_file_credential_failure("update", failures)
-
-    def _notify_file_credentials_session_started(self) -> None:
-        failures: dict[str, Exception] = {}
-        with self._file_credential_lock:
-            for name, lifecycle in self._file_credential_lifecycles.items():
-                try:
-                    lifecycle.on_session_started()
-                except Exception as error:
-                    failures[name] = error
-        self._raise_first_file_credential_failure("update", failures)
 
     def _startup_timeout_message(self) -> str:
         return (
@@ -2707,8 +2643,7 @@ class ACPAgent(AgentBase):
                         raise ACPFileCredentialNeedsReauthError(
                             "ChatGPT authentication needs to be refreshed."
                         ) from exc
-                    self._notify_file_credentials_auth_succeeded(method_id)
-                    await self._sync_file_credentials_best_effort(changed_only=True)
+                    await self._flush_file_credentials(changed_only=True)
                 else:
                     logger.warning(
                         "ACP server offers auth methods %s but no matching "
@@ -2868,7 +2803,7 @@ class ACPAgent(AgentBase):
             # raise a descriptive one so _acp_error_detail (str(exc)) isn't blank.
             raise TimeoutError(self._startup_timeout_message()) from None
         self._working_dir = working_dir
-        self._notify_file_credentials_session_started()
+        self._flush_file_credentials_blocking()
 
     def _reset_client_for_turn(
         self,
@@ -3542,7 +3477,7 @@ class ACPAgent(AgentBase):
             raise
         finally:
             self._clear_turn_callbacks()
-            self._sync_file_credentials_best_effort_blocking(changed_only=True)
+            self._flush_file_credentials_blocking(changed_only=True)
 
     @observe(name="acp_agent.astep", ignore_inputs=["conversation", "on_event"])
     async def astep(
@@ -3758,7 +3693,7 @@ class ACPAgent(AgentBase):
             raise
         finally:
             self._clear_turn_callbacks()
-            await self._sync_file_credentials_best_effort(changed_only=True)
+            await self._flush_file_credentials(changed_only=True)
 
     def ask_agent(self, question: str) -> str | None:
         """Fork the ACP session, prompt the fork, and return the response."""
@@ -3816,7 +3751,7 @@ class ACPAgent(AgentBase):
                 return result
             finally:
                 try:
-                    await self._sync_file_credentials_best_effort(changed_only=True)
+                    await self._flush_file_credentials(changed_only=True)
                 finally:
                     client._fork_session_id = None
                     client._fork_accumulated_text.clear()
@@ -3962,46 +3897,62 @@ class ACPAgent(AgentBase):
                 if self._closed and not self._file_credential_lifecycles:
                     return
             self._closed = True
-            sync_failures = self._sync_file_credentials_collect()
-            release_failures = self._release_file_credentials_collect(
-                exclude=set(sync_failures)
-            )
-            failures = {**sync_failures, **release_failures}
-            try:
-                self._cleanup()
-            except Exception as exc:
-                failures["ACP runtime"] = exc
+            failures = self._shutdown_runtime(discard_bindings=True)
             self._raise_first_file_credential_failure("close", failures)
 
     def _cleanup(self) -> None:
-        """Internal cleanup of ACP resources."""
-        # Close the connection first
+        failures = self._shutdown_runtime(discard_bindings=False)
+        self._raise_first_file_credential_failure("restart", failures)
+
+    def _shutdown_runtime(self, *, discard_bindings: bool) -> dict[str, Exception]:
+        failures: dict[str, Exception] = {}
         if self._conn is not None and self._executor is not None:
             conn = self._conn
             try:
-                self._executor.run_async(conn.close())
+                self._executor.run_async(conn.close, timeout=5.0)
             except Exception as e:
                 logger.debug("Error closing ACP connection: %s", e)
             self._conn = None
 
-        # Terminate the subprocess
-        if self._process is not None:
+        process = self._process
+        if process is not None:
             try:
-                self._process.terminate()
+                if process.returncode is None or not isinstance(
+                    process.returncode, int
+                ):
+                    process.terminate()
+                if self._executor is not None:
+                    self._executor.run_async(
+                        self._wait_for_process,
+                        process,
+                        timeout=5.0,
+                    )
             except Exception as e:
                 logger.debug("Error terminating ACP process: %s", e)
-            try:
-                self._process.kill()
-            except Exception as e:
-                logger.debug("Error killing ACP process: %s", e)
+                try:
+                    process.kill()
+                    if self._executor is not None:
+                        self._executor.run_async(self._wait_for_process, process)
+                except Exception as kill_error:
+                    logger.debug("Error killing ACP process: %s", kill_error)
             self._process = None
+
+        failures.update(self._release_file_credentials_collect())
+        if discard_bindings:
+            with self._file_credential_lock:
+                self._file_credential_bindings = {}
 
         if self._executor is not None:
             try:
                 self._executor.close()
             except Exception as e:
-                logger.debug("Error closing executor: %s", e)
+                failures["ACP executor"] = e
             self._executor = None
+        return failures
+
+    @staticmethod
+    async def _wait_for_process(process: asyncio.subprocess.Process) -> None:
+        await process.wait()
 
     def release_runtime(self) -> None:
         """Disarm this agent's finalizer after handing its live ACP runtime to a
@@ -4023,6 +3974,7 @@ class ACPAgent(AgentBase):
         with self._file_credential_close_lock:
             with self._file_credential_lock:
                 self._file_credential_lifecycles = {}
+                self._file_credential_bindings = {}
             self._closed = True
 
     def __del__(self) -> None:

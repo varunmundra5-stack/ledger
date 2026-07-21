@@ -13,7 +13,6 @@ from uuid import UUID, uuid4
 import httpx
 from pydantic import BaseModel
 
-from openhands.agent_server.codex_auth import CODEX_AUTH_SECRET_NAME, CodexAuthBroker
 from openhands.agent_server.config import Config, WebhookSpec
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -32,11 +31,14 @@ from openhands.agent_server.models import (
     StoredConversation,
     UpdateConversationRequest,
 )
+from openhands.agent_server.persistence import FileSecretsStore
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.agent_server.skills_service import discover_profile_skills
 from openhands.agent_server.utils import safe_rmtree, utc_now
 from openhands.sdk import LLM, AgentContext, Event, Message
+from openhands.sdk.agent import ACPAgent
+from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.conversation.persistence_const import BASE_STATE
 from openhands.sdk.conversation.state import (
@@ -47,12 +49,12 @@ from openhands.sdk.conversation.title_utils import (
     extract_message_text,
     generate_title_from_message,
 )
+from openhands.sdk.credential import VersionedCredentialBinding
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.mcp.utils import MCPToolProvider
-from openhands.sdk.secret import LookupSecret
 from openhands.sdk.tool import BROWSER_TOOL_NAME, Tool, is_tool_usable
 from openhands.sdk.tool.client_tool import register_client_tools
 from openhands.sdk.utils.cipher import Cipher
@@ -505,7 +507,7 @@ class ConversationService:
     session_api_key: str | None = field(default=None)
     cipher: Cipher | None = None
     mcp_tool_provider: MCPToolProvider | None = None
-    codex_auth_broker: CodexAuthBroker | None = None
+    secrets_store: FileSecretsStore | None = None
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     max_concurrent_runs: int = 10
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
@@ -519,6 +521,9 @@ class ConversationService:
     )
     _lease_renewal_task: asyncio.Task | None = field(default=None, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
+    _credential_bindings: dict[UUID, dict[str, VersionedCredentialBinding]] = field(
+        default_factory=dict, init=False
+    )
 
     def _load_catalog_sync(self) -> dict[UUID, _ConversationRecord]:
         records: dict[UUID, _ConversationRecord] = {}
@@ -563,8 +568,22 @@ class ConversationService:
             base_state_file.read_text(), context=context
         )
 
-    def _rebind_persisted_codex_auth_sync(
-        self, record: _ConversationRecord, source: LookupSecret
+    def activate_credential_binding(
+        self,
+        conversation_id: UUID,
+        secret_name: str,
+        binding: VersionedCredentialBinding,
+    ) -> None:
+        self._credential_bindings.setdefault(conversation_id, {})[secret_name] = binding
+
+    @staticmethod
+    def _is_codex_agent(agent: AgentBase | None) -> bool:
+        return isinstance(agent, ACPAgent) and agent.acp_server == "codex"
+
+    def _strip_persisted_credential_sync(
+        self,
+        record: _ConversationRecord,
+        secret_name: str,
     ) -> bool:
         conversation_dir = self.conversations_dir / record.stored.id.hex
         base_state_file = conversation_dir / BASE_STATE
@@ -574,15 +593,10 @@ class ConversationService:
         state = ConversationState.model_validate_json(
             base_state_file.read_text(), context=context
         )
-        state.secret_registry.update_secrets({CODEX_AUTH_SECRET_NAME: source})
-        stored = record.stored.model_copy(
-            update={
-                "secrets": {
-                    **record.stored.secrets,
-                    CODEX_AUTH_SECRET_NAME: source,
-                }
-            }
-        )
+        state.secret_registry.secret_sources.pop(secret_name, None)
+        stored_secrets = dict(record.stored.secrets)
+        stored_secrets.pop(secret_name, None)
+        stored = record.stored.model_copy(update={"secrets": stored_secrets})
         atomic_write_text(
             conversation_dir / "meta.json",
             stored.model_dump_json(context=context),
@@ -593,6 +607,36 @@ class ConversationService:
         )
         record.stored = stored
         return True
+
+    async def _has_local_codex_credential(self) -> bool:
+        if self.secrets_store is None:
+            return False
+        value = await asyncio.to_thread(
+            self.secrets_store.get_secret,
+            CODEX_AUTH_SECRET_NAME,
+        )
+        return value is not None
+
+    async def _resolve_credential_bindings(
+        self,
+        stored: StoredConversation,
+    ) -> dict[str, VersionedCredentialBinding]:
+        bindings = self._credential_bindings.pop(stored.id, {})
+        if (
+            CODEX_AUTH_SECRET_NAME not in bindings
+            and self._is_codex_agent(stored.agent)
+            and await self._has_local_codex_credential()
+        ):
+            assert self.secrets_store is not None
+            from openhands.agent_server.credential_binding import (
+                LocalVersionedCredentialBinding,
+            )
+
+            bindings[CODEX_AUTH_SECRET_NAME] = LocalVersionedCredentialBinding(
+                self.secrets_store,
+                CODEX_AUTH_SECRET_NAME,
+            )
+        return bindings
 
     async def _conversation_info(
         self, conversation_id: UUID, record: _ConversationRecord
@@ -949,14 +993,20 @@ class ConversationService:
                         ),
                         False,
                     )
-                source = request.secrets.get(CODEX_AUTH_SECRET_NAME)
-                if isinstance(source, LookupSecret):
-                    rebound = await asyncio.to_thread(
-                        self._rebind_persisted_codex_auth_sync,
+                managed_codex_credential = self._is_codex_agent(
+                    existing_record.stored.agent
+                ) and (
+                    CODEX_AUTH_SECRET_NAME
+                    in self._credential_bindings.get(conversation_id, {})
+                    or await self._has_local_codex_credential()
+                )
+                if managed_codex_credential:
+                    stripped = await asyncio.to_thread(
+                        self._strip_persisted_credential_sync,
                         existing_record,
-                        source,
+                        CODEX_AUTH_SECRET_NAME,
                     )
-                    if not rebound:
+                    if not stripped:
                         raise ValueError(
                             f"Persisted conversation {conversation_id} "
                             "has no base state"
@@ -1004,6 +1054,15 @@ class ConversationService:
             )
 
         request = _prepare_request_workspace(request, conversation_id)
+
+        managed_codex_credential = self._is_codex_agent(request.agent) and (
+            CODEX_AUTH_SECRET_NAME in self._credential_bindings.get(conversation_id, {})
+            or await self._has_local_codex_credential()
+        )
+        if managed_codex_credential and CODEX_AUTH_SECRET_NAME in request.secrets:
+            durable_secrets = dict(request.secrets)
+            durable_secrets.pop(CODEX_AUTH_SECRET_NAME, None)
+            request = request.model_copy(update={"secrets": durable_secrets})
 
         # Dynamically register tools from client's registry
         if request.tool_module_qualnames:
@@ -1186,8 +1245,7 @@ class ConversationService:
                     f"Failed to close event service for conversation "
                     f"{conversation_id}: {e}"
                 )
-            if self.codex_auth_broker is not None:
-                self.codex_auth_broker.revoke(conversation_id)
+            self._credential_bindings.pop(conversation_id, None)
 
             # Safely remove only the conversation directory (workspace is preserved).
             # This operation may fail due to permission issues, but we don't want that
@@ -1470,22 +1528,17 @@ class ConversationService:
         async with self._lifecycle_lock:
             event_services = self._event_services
             if event_services is None:
-                if self.codex_auth_broker is not None:
-                    self.codex_auth_broker.clear()
                 return
             self._event_services = None
             self._conversation_records = {}
+            self._credential_bindings = {}
         # This stops conversations and saves meta
-        try:
-            await asyncio.gather(
-                *[
-                    event_service.__aexit__(exc_type, exc_value, traceback)
-                    for event_service in event_services.values()
-                ]
-            )
-        finally:
-            if self.codex_auth_broker is not None:
-                self.codex_auth_broker.clear()
+        await asyncio.gather(
+            *[
+                event_service.__aexit__(exc_type, exc_value, traceback)
+                for event_service in event_services.values()
+            ]
+        )
         if self._run_executor is not None:
             self._run_executor.shutdown(wait=False)
             self._run_executor = None
@@ -1503,7 +1556,6 @@ class ConversationService:
         )
 
         get_settings_store(config)
-        codex_auth_broker = CodexAuthBroker(get_secrets_store(config))
         return ConversationService(
             conversations_dir=config.conversations_path,
             webhook_specs=config.webhooks,
@@ -1512,7 +1564,7 @@ class ConversationService:
             ),
             cipher=config.cipher,
             mcp_tool_provider=create_settings_backed_mcp_tool_provider(config),
-            codex_auth_broker=codex_auth_broker,
+            secrets_store=get_secrets_store(config),
             max_concurrent_runs=config.max_concurrent_runs,
             lease_ttl_seconds=config.lease_ttl_seconds,
         )
@@ -1522,12 +1574,13 @@ class ConversationService:
         if event_services is None:
             raise ValueError("inactive_service")
 
+        credential_bindings = await self._resolve_credential_bindings(stored)
         event_service = EventService(
             stored=stored,
             conversations_dir=self.conversations_dir,
             cipher=self.cipher,
             mcp_tool_provider=self.mcp_tool_provider,
-            codex_auth_broker=self.codex_auth_broker,
+            credential_bindings=credential_bindings,
             owner_instance_id=self.owner_instance_id,
             lease_ttl_seconds=self.lease_ttl_seconds,
         )
@@ -1567,12 +1620,10 @@ class ConversationService:
             if self._event_services is not event_services:
                 raise ValueError("inactive_service")
         except Exception:
-            # Clean up the event service if startup fails
-            try:
-                await event_service.close()
-            finally:
-                if self.codex_auth_broker is not None:
-                    self.codex_auth_broker.revoke(stored.id)
+            await event_service.close()
+            pending = self._credential_bindings.setdefault(stored.id, {})
+            for secret_name, binding in credential_bindings.items():
+                pending.setdefault(secret_name, binding)
             raise
 
         event_services[stored.id] = event_service

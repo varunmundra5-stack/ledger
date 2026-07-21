@@ -14,7 +14,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import httpx
 import pytest
@@ -23,8 +23,6 @@ from litellm.types.utils import Choices, Message as LiteLLMMessage, ModelRespons
 from pydantic import SecretStr
 
 from openhands.agent_server.__main__ import preload_modules
-from openhands.agent_server.codex_auth import CODEX_AUTH_SECRET_NAME
-from openhands.agent_server.persistence import FileSecretsStore
 from openhands.sdk import LLM, Agent, AgentContext, Conversation
 from openhands.sdk.conversation import RemoteConversation
 from openhands.sdk.event import (
@@ -41,7 +39,6 @@ from openhands.sdk.event import (
     SystemPromptEvent,
 )
 from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher
-from openhands.sdk.secret import LookupSecret
 from openhands.sdk.skills import Skill
 from openhands.sdk.subagent import AgentDefinition
 from openhands.sdk.subagent.registry import (
@@ -172,50 +169,6 @@ def test_health_endpoints_return_ok_json(server_env):
             response = client.get(f"{server_env['host']}{endpoint}", timeout=1.0)
             assert response.status_code == 200
             assert response.json() == {"status": "ok"}
-
-
-def test_local_codex_auth_broker_over_live_server(server_env):
-    credential = json.dumps(
-        {
-            "auth_mode": "chatgpt",
-            "tokens": {
-                "id_token": "id-r0",
-                "access_token": "access-r0",
-                "refresh_token": "refresh-r0",
-            },
-        }
-    )
-    broker = server_env["conversation_service"].codex_auth_broker
-    assert broker is not None
-    broker.store = FileSecretsStore(server_env["workspace_path"] / "codex-auth")
-    broker.store.set_secret(CODEX_AUTH_SECRET_NAME, credential)
-    conversation_id = uuid4()
-    source = LookupSecret(
-        url=(f"{server_env['host']}/api/settings/secrets/{CODEX_AUTH_SECRET_NAME}"),
-        headers={"X-Session-API-Key": "broad-key"},
-    )
-    brokered_source = broker.ensure_brokered_source(conversation_id, source)
-    token = brokered_source.headers["X-OH-Codex-Token"]
-
-    with httpx.Client(base_url=server_env["host"], timeout=10.0) as client:
-        broker_response = client.get(
-            brokered_source.url,
-            headers={"X-OH-Codex-Token": token},
-        )
-        assert broker_response.status_code == 200
-        assert broker_response.text == credential
-        assert broker_response.headers["cache-control"] == "no-store"
-
-        delete_response = client.delete(
-            brokered_source.url,
-            headers={"X-OH-Codex-Token": token},
-        )
-        assert delete_response.status_code == 204
-        revoked_response = client.get(
-            brokered_source.url,
-            headers={"X-OH-Codex-Token": token},
-        )
-        assert revoked_response.status_code == 401
 
 
 @pytest.fixture

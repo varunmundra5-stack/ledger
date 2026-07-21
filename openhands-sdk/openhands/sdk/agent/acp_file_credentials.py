@@ -1,79 +1,53 @@
-"""Manage brokered ACP file credentials."""
-
 from __future__ import annotations
 
 import hashlib
 import json
-import re
+import shutil
+import tempfile
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Any, Protocol
 
-import httpx
-
-from openhands.sdk.secret import LookupSecret
+from openhands.sdk.conversation.secret_registry import SecretRegistry
+from openhands.sdk.credential import (
+    CredentialConflict,
+    CredentialNeedsReauthentication,
+    CredentialSyncError,
+    ResolvedCredential,
+    VersionedCredentialBinding,
+)
+from openhands.sdk.logger import get_logger
 from openhands.sdk.utils.files import atomic_write_text
 
 
-if TYPE_CHECKING:
-    from openhands.sdk.conversation.secret_registry import SecretRegistry
-
+logger = get_logger(__name__)
 
 CODEX_AUTH_SECRET_NAME = "CODEX_AUTH_JSON"
 
-_CODEX_AUTH_SYNC_DELAYS: tuple[float, ...] = (0.1, 0.5)
-_CODEX_AUTH_HTTP_TIMEOUT = 5.0
-_CODEX_AUTH_REMOTE_CHECK_INTERVAL = 60.0
-_CODEX_AUTH_DIGEST_HEADER = "X-Codex-Auth-Digest"
-_CODEX_AUTH_SANDBOX_HEADER = "X-OH-Sandbox-Key"
-_CODEX_AUTH_SCOPE_HEADER = "X-OH-Codex-Token"
-_CODEX_LOCAL_AUTH_SCOPE_HEADER = "X-OH-Codex-Token"
-_CODEX_LOCAL_REFRESH_USERNAME = "codex"
-_CODEX_REFRESH_TOKEN_URL_ENV = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
 _CHATGPT_AUTH_PATH = Path(".codex") / "auth.json"
+_MONITOR_INTERVAL_SECONDS = 0.1
+_STABLE_READ_DELAY_SECONDS = 0.01
+_SYNC_RETRY_DELAYS: tuple[float, ...] = (0.1, 0.5)
 
+ACPFileCredentialNeedsReauthError = CredentialNeedsReauthentication
+ACPFileCredentialSyncError = CredentialSyncError
 
-class ACPFileCredentialNeedsReauthError(RuntimeError):
-    pass
-
-
-class ACPFileCredentialSyncError(RuntimeError):
-    pass
+AsyncRunner = Callable[[Coroutine[Any, Any, Any]], Any]
 
 
 class ACPFileCredentialLifecycle(Protocol):
-    """Define a brokered ACP file credential lifecycle."""
-
     secret_name: str
     path: Path | None
 
-    @property
-    def may_have_changed(self) -> bool: ...
-
-    def load(self) -> str | None: ...
-
-    def bind(
-        self,
-        path: Path,
-        registry: SecretRegistry,
-        remote_value: str,
-        env: dict[str, str],
-    ) -> None: ...
-
-    def should_preserve_existing(self, path: Path) -> bool: ...
-
-    def record_materialized(self, remote_value: str, local_value: str) -> None: ...
-
-    def on_auth_succeeded(self, method_id: str) -> None: ...
-
-    def on_session_started(self) -> None: ...
+    def materialize(self, registry: SecretRegistry, env: dict[str, str]) -> None: ...
 
     def track_current(self) -> None: ...
 
-    def sync(self) -> None: ...
+    def flush(self) -> None: ...
 
-    def release(self) -> None: ...
+    def close(self) -> None: ...
 
 
 def codex_auth_file(env: dict[str, str]) -> Path:
@@ -88,97 +62,16 @@ def codex_auth_file_is_chatgpt(env: dict[str, str]) -> bool:
     if not path.is_file():
         return False
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+        return is_valid_codex_auth(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
         return False
-    return isinstance(data, dict) and "tokens" in data
 
 
 def write_secret_file(path: Path, value: str) -> None:
     atomic_write_text(path, value)
 
 
-def _codex_auth_ancestor_file(path: Path) -> Path:
-    return path.with_name(f".{path.name}.cloud-digest")
-
-
-def _read_codex_auth_ancestor(path: Path) -> str | None:
-    try:
-        return _codex_auth_ancestor_file(path).read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-
-
-def _write_codex_auth_ancestor(path: Path, digest: str) -> None:
-    write_secret_file(_codex_auth_ancestor_file(path), digest)
-
-
-def _update_codex_auth_source(
-    source: LookupSecret, value: str, expected_digest: str
-) -> None:
-    response = httpx.put(
-        source.url,
-        headers=source.headers,
-        json={"expected_digest": expected_digest, "value": value},
-        timeout=_CODEX_AUTH_HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
-
-
-def _get_codex_auth_source(source: LookupSecret) -> str:
-    response = httpx.get(
-        source.url,
-        headers=source.headers,
-        timeout=_CODEX_AUTH_HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.text
-
-
-def _touch_codex_auth_source(source: LookupSecret) -> str | None:
-    response = httpx.head(
-        source.url,
-        headers=source.headers,
-        timeout=_CODEX_AUTH_HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
-    digest = response.headers.get(_CODEX_AUTH_DIGEST_HEADER)
-    return (
-        digest
-        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
-        else None
-    )
-
-
-def _release_codex_auth_source(source: LookupSecret) -> None:
-    response = httpx.delete(
-        source.url,
-        headers=source.headers,
-        timeout=_CODEX_AUTH_HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
-
-
-def _codex_auth_refresh_url(source: LookupSecret) -> str | None:
-    headers = {name.lower(): value for name, value in source.headers.items()}
-    session_api_key = headers.get(_CODEX_AUTH_SANDBOX_HEADER.lower())
-    codex_auth_token = headers.get(
-        _CODEX_LOCAL_AUTH_SCOPE_HEADER.lower()
-    ) or headers.get(_CODEX_AUTH_SCOPE_HEADER.lower())
-    if not codex_auth_token:
-        return None
-    url = httpx.URL(source.url)
-    refresh_path = f"{url.path.rstrip('/')}/refresh"
-    return str(
-        url.copy_with(
-            path=refresh_path,
-            username=session_api_key or _CODEX_LOCAL_REFRESH_USERNAME,
-            password=codex_auth_token,
-        )
-    )
-
-
-def _is_valid_codex_auth_value(value: object) -> bool:
+def is_valid_codex_auth(value: object) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
     try:
@@ -198,93 +91,229 @@ def _is_valid_codex_auth_value(value: object) -> bool:
 
 
 class _CodexAuthLifecycle:
-    """Manage brokered Codex subscription auth."""
-
     secret_name = CODEX_AUTH_SECRET_NAME
 
-    def __init__(self, source: LookupSecret, refresh_url: str):
-        self.source = source
-        self.refresh_url = refresh_url
-        self.path: Path | None = None
-        self.expected_digest: str | None = None
-        self.last_remote_check = 0.0
-        self.registry: SecretRegistry | None = None
-        self._may_have_changed = False
-        self._tracked_local_digest: str | None = None
-
-    @property
-    def may_have_changed(self) -> bool:
-        return self._may_have_changed
-
-    def load(self) -> str | None:
-        try:
-            return self.source.get_value()
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (404, 422):
-                detail = (
-                    "ChatGPT authentication was not found in the credential broker."
-                    if exc.response.status_code == 404
-                    else "ChatGPT authentication needs to be refreshed."
-                )
-                raise ACPFileCredentialNeedsReauthError(detail) from exc
-            raise ACPFileCredentialSyncError(
-                "Codex credentials could not be loaded from the credential broker."
-            ) from exc
-        except httpx.RequestError as exc:
-            raise ACPFileCredentialSyncError(
-                "Codex credentials could not be loaded from the credential broker."
-            ) from exc
-
-    def bind(
+    def __init__(
         self,
-        path: Path,
-        registry: SecretRegistry,
-        remote_value: str,
-        env: dict[str, str],
+        binding: VersionedCredentialBinding,
+        run_async: AsyncRunner,
     ) -> None:
-        if not _is_valid_codex_auth_value(remote_value):
-            raise ACPFileCredentialSyncError(
-                "The credential broker returned invalid Codex credentials."
+        self.binding = binding
+        self.run_async = run_async
+        self.path: Path | None = None
+        self._runtime_dir: Path | None = None
+        self._registry: SecretRegistry | None = None
+        self._expected_version: str | None = None
+        self._local_digest: str | None = None
+        self._error: CredentialSyncError | None = None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._monitor: threading.Thread | None = None
+
+    def materialize(self, registry: SecretRegistry, env: dict[str, str]) -> None:
+        resolved = self._load()
+        if not is_valid_codex_auth(resolved.value):
+            raise CredentialNeedsReauthentication(
+                "ChatGPT authentication is invalid. Please sign in again."
             )
+        runtime_dir = Path(tempfile.mkdtemp(prefix="openhands-codex-"))
+        runtime_dir.chmod(0o700)
+        path = runtime_dir / "auth.json"
+        try:
+            write_secret_file(path, resolved.value)
+        except BaseException:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+            raise
         self.path = path
-        self.registry = registry
-        self.expected_digest = hashlib.sha256(remote_value.encode()).hexdigest()
-        env[_CODEX_REFRESH_TOKEN_URL_ENV] = self.refresh_url
-        self._track_transport()
-
-    def should_preserve_existing(self, path: Path) -> bool:
-        return _read_codex_auth_ancestor(path) == self.expected_digest
-
-    def record_materialized(self, remote_value: str, local_value: str) -> None:
-        path = self.path
-        expected_digest = self.expected_digest
-        assert path is not None
-        assert expected_digest is not None
-        _write_codex_auth_ancestor(path, expected_digest)
-        local_digest = hashlib.sha256(local_value.encode()).hexdigest()
-        self.last_remote_check = (
-            time.monotonic() if local_digest == expected_digest else 0.0
+        self._runtime_dir = runtime_dir
+        self._registry = registry
+        self._expected_version = resolved.version
+        self._local_digest = self._digest(resolved.value)
+        self._track(resolved.value)
+        env["CODEX_HOME"] = str(runtime_dir)
+        self._monitor = threading.Thread(
+            target=self._monitor_loop,
+            name="codex-credential-monitor",
+            daemon=True,
         )
-        if local_digest != expected_digest:
-            self._may_have_changed = True
-        self._track_values(remote_value, expected_digest)
-        if local_digest != expected_digest:
-            self._track_values(local_value, local_digest)
-        self._tracked_local_digest = local_digest
+        self._monitor.start()
+        logger.info(
+            "credential_binding_materialized",
+            extra={"credential": self.secret_name},
+        )
 
-    def on_auth_succeeded(self, method_id: str) -> None:
-        if method_id == "chat-gpt":
-            self._may_have_changed = True
+    def track_current(self) -> None:
+        with self._lock:
+            try:
+                self._raise_sticky_error()
+                value = self._read_stable(attempts=1)
+                if value is not None:
+                    self._sync_value(value)
+                self._raise_sticky_error()
+            except CredentialSyncError as exc:
+                self._set_error(exc)
+                raise
 
-    def on_session_started(self) -> None:
-        self._may_have_changed = True
+    def flush(self) -> None:
+        with self._lock:
+            try:
+                self._raise_sticky_error()
+                value = self._read_stable(attempts=3)
+                if value is None:
+                    raise CredentialSyncError(
+                        "Codex credentials could not be read safely."
+                    )
+                self._sync_value(value)
+                self._raise_sticky_error()
+            except CredentialSyncError as exc:
+                self._set_error(exc)
+                raise
 
-    def _track_values(self, value: str, value_digest: str | None = None) -> None:
-        registry = self.registry
+    def close(self) -> None:
+        self._stop.set()
+        monitor = self._monitor
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=2.0)
+        error: BaseException | None = None
+        try:
+            self.flush()
+            logger.info(
+                "credential_binding_final_flush",
+                extra={"credential": self.secret_name, "outcome": "success"},
+            )
+        except BaseException as exc:
+            error = exc
+            logger.warning(
+                "credential_binding_final_flush",
+                extra={"credential": self.secret_name, "outcome": "failure"},
+            )
+        runtime_dir = self._runtime_dir
+        if runtime_dir is not None:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+        self.path = None
+        self._runtime_dir = None
+        self._registry = None
+        self._monitor = None
+        if error is not None:
+            raise error
+
+    def _monitor_loop(self) -> None:
+        while not self._stop.wait(_MONITOR_INTERVAL_SECONDS):
+            try:
+                with self._lock:
+                    if self._error is not None:
+                        return
+                    value = self._read_stable(attempts=1)
+                    if value is not None:
+                        self._sync_value(value)
+            except CredentialSyncError as exc:
+                with self._lock:
+                    self._set_error(exc)
+                return
+            except Exception as exc:
+                with self._lock:
+                    self._set_error(
+                        CredentialSyncError("Codex credential monitoring failed.")
+                    )
+                logger.warning("credential_binding_monitor_failed", exc_info=exc)
+                return
+
+    def _read_stable(self, *, attempts: int) -> str | None:
+        path = self.path
+        if path is None:
+            return None
+        for attempt in range(attempts):
+            try:
+                first = path.read_bytes()
+                time.sleep(_STABLE_READ_DELAY_SECONDS)
+                second = path.read_bytes()
+                if first == second:
+                    value = second.decode("utf-8")
+                    if is_valid_codex_auth(value):
+                        return value
+            except (OSError, UnicodeError):
+                pass
+            if attempt + 1 < attempts:
+                delay_index = min(attempt, len(_SYNC_RETRY_DELAYS) - 1)
+                time.sleep(_SYNC_RETRY_DELAYS[delay_index])
+        return None
+
+    def _sync_value(self, value: str) -> None:
+        digest = self._digest(value)
+        if digest == self._local_digest:
+            return
+        self._track(value)
+        logger.info(
+            "credential_binding_rotation_detected",
+            extra={"credential": self.secret_name},
+        )
+        expected_version = self._expected_version
+        if expected_version is None:
+            raise CredentialSyncError("Credential binding was not initialized.")
+        error: CredentialSyncError | None = None
+        for attempt in range(len(_SYNC_RETRY_DELAYS) + 1):
+            try:
+                successor = self.run_async(
+                    self.binding.replace(expected_version, value)
+                )
+            except CredentialConflict:
+                logger.warning(
+                    "credential_binding_replace",
+                    extra={"credential": self.secret_name, "outcome": "conflict"},
+                )
+                raise
+            except CredentialSyncError as exc:
+                error = exc
+                resolved = self._load_after_ambiguous_write()
+                if resolved is not None and resolved.value == value:
+                    self._expected_version = resolved.version
+                    self._local_digest = digest
+                    logger.info(
+                        "credential_binding_replace",
+                        extra={"credential": self.secret_name, "outcome": "converged"},
+                    )
+                    return
+                if attempt < len(_SYNC_RETRY_DELAYS):
+                    time.sleep(_SYNC_RETRY_DELAYS[attempt])
+                    continue
+                break
+            else:
+                if not isinstance(successor, str) or not successor:
+                    raise CredentialSyncError(
+                        "Credential source returned an invalid version."
+                    )
+                self._expected_version = successor
+                self._local_digest = digest
+                logger.info(
+                    "credential_binding_replace",
+                    extra={"credential": self.secret_name, "outcome": "success"},
+                )
+                return
+        assert error is not None
+        raise error
+
+    def _load(self) -> ResolvedCredential:
+        resolved = self.run_async(self.binding.load())
+        if not isinstance(resolved, ResolvedCredential):
+            raise CredentialSyncError("Credential source returned an invalid response.")
+        return resolved
+
+    def _load_after_ambiguous_write(self) -> ResolvedCredential | None:
+        try:
+            return self._load()
+        except CredentialNeedsReauthentication as exc:
+            raise CredentialConflict(
+                "The canonical credential was deleted during synchronization."
+            ) from exc
+        except CredentialSyncError:
+            return None
+
+    def _track(self, value: str) -> None:
+        registry = self._registry
         if registry is None:
             return
-        value_digest = value_digest or hashlib.sha256(value.encode()).hexdigest()
-        mask_name = f"{self.secret_name}.{value_digest}"
+        digest = self._digest(value)
+        mask_name = f"{self.secret_name}.{digest}"
         exported_values = {mask_name: value}
         try:
             tokens = json.loads(value).get("tokens", {})
@@ -294,165 +323,31 @@ class _CodexAuthLifecycle:
             for name, token in tokens.items():
                 if isinstance(token, str) and token:
                     exported_values[f"{mask_name}.tokens.{name}"] = token
-        registry.track_exported_values(exported_values)
-
-    def _track_transport(self) -> None:
-        registry = self.registry
-        if registry is None:
-            return
-        exported_values = {
-            f"{self.secret_name}.refresh_url": self.refresh_url,
-        }
-        for name, value in self.source.headers.items():
-            exported_values[f"{self.secret_name}.header.{name.lower()}"] = value
-        registry.track_exported_values(exported_values)
-
-    def track_current(self) -> None:
-        path = self.path
-        if path is None:
-            return
-        value = path.read_bytes()
-        digest = hashlib.sha256(value).hexdigest()
-        if digest == self._tracked_local_digest:
-            return
-        text_value = value.decode()
-        self._track_values(text_value, digest)
-        self._tracked_local_digest = digest
-        if digest != self.expected_digest:
-            self._may_have_changed = True
-
-    def sync(self) -> None:
-        path = self.path
-        expected_digest = self.expected_digest
-        if path is None or expected_digest is None:
-            return
         try:
-            value = path.read_bytes()
-            text_value = value.decode()
-        except (OSError, UnicodeError) as exc:
-            raise ACPFileCredentialSyncError(
-                "Codex credentials could not be saved to the credential broker."
+            registry.track_exported_values(exported_values)
+        except Exception as exc:
+            raise CredentialSyncError(
+                "Rotated credentials could not be registered for masking."
             ) from exc
-        if not _is_valid_codex_auth_value(text_value):
-            raise ACPFileCredentialSyncError(
-                "Local Codex credentials are invalid; the brokered copy was preserved."
-            )
-        digest = hashlib.sha256(value).hexdigest()
-        changed = digest != expected_digest
-        now = time.monotonic()
-        if (
-            not changed
-            and self.last_remote_check > 0
-            and now - self.last_remote_check < _CODEX_AUTH_REMOTE_CHECK_INTERVAL
-        ):
-            return
-        attempts = len(_CODEX_AUTH_SYNC_DELAYS) + 1
-        for attempt in range(attempts):
-            try:
-                if changed:
-                    _update_codex_auth_source(self.source, text_value, expected_digest)
-                else:
-                    remote_digest = _touch_codex_auth_source(self.source)
-                    if (
-                        isinstance(remote_digest, str)
-                        and remote_digest != expected_digest
-                    ):
-                        self._adopt(_get_codex_auth_source(self.source))
-                        return
-            except httpx.HTTPStatusError as exc:
-                if changed and exc.response.status_code == 409:
-                    try:
-                        self._adopt(_get_codex_auth_source(self.source))
-                    except (httpx.HTTPError, ACPFileCredentialSyncError) as remote_exc:
-                        if attempt == attempts - 1:
-                            raise ACPFileCredentialSyncError(
-                                "Codex credentials could not be reconciled with "
-                                "the credential broker."
-                            ) from remote_exc
-                    else:
-                        return
-                if attempt == attempts - 1:
-                    raise ACPFileCredentialSyncError(
-                        "Codex credentials could not be saved to the credential broker."
-                    ) from exc
-            except httpx.RequestError as exc:
-                if attempt == attempts - 1:
-                    raise ACPFileCredentialSyncError(
-                        "Codex credentials could not be saved to the credential broker."
-                    ) from exc
-            else:
-                break
-            if attempt < attempts - 1:
-                time.sleep(_CODEX_AUTH_SYNC_DELAYS[attempt])
-        if changed:
-            try:
-                _write_codex_auth_ancestor(path, digest)
-            except OSError as exc:
-                raise ACPFileCredentialSyncError(
-                    "Codex credentials could not be saved to the credential broker."
-                ) from exc
-            self._track_values(text_value)
-            self.expected_digest = digest
-            self._tracked_local_digest = digest
-        self.last_remote_check = now
 
-    def _adopt(self, value: str) -> None:
-        path = self.path
-        assert path is not None
-        if not _is_valid_codex_auth_value(value):
-            raise ACPFileCredentialSyncError(
-                "The credential broker returned invalid Codex credentials; "
-                "the local copy was preserved."
-            )
-        digest = hashlib.sha256(value.encode()).hexdigest()
-        try:
-            write_secret_file(path, value)
-            _write_codex_auth_ancestor(path, digest)
-        except OSError as exc:
-            raise ACPFileCredentialSyncError(
-                "Codex credentials could not be reconciled with the credential broker."
-            ) from exc
-        self._track_values(value)
-        self.expected_digest = digest
-        self._tracked_local_digest = digest
-        self.last_remote_check = time.monotonic()
+    def _set_error(self, error: CredentialSyncError) -> None:
+        if self._error is None:
+            self._error = error
 
-    def release(self) -> None:
-        try:
-            _release_codex_auth_source(self.source)
-        except httpx.HTTPError as exc:
-            raise ACPFileCredentialSyncError(
-                "Codex credential source could not be released."
-            ) from exc
-        self.clear()
+    def _raise_sticky_error(self) -> None:
+        if self._error is not None:
+            raise self._error
 
-    def clear(self) -> None:
-        self.path = None
-        self.expected_digest = None
-        self.last_remote_check = 0.0
-        self.registry = None
-        self._may_have_changed = False
-        self._tracked_local_digest = None
-
-
-def _create_codex_auth_lifecycle(
-    source: LookupSecret,
-) -> ACPFileCredentialLifecycle | None:
-    refresh_url = _codex_auth_refresh_url(source)
-    return _CodexAuthLifecycle(source, refresh_url) if refresh_url is not None else None
-
-
-_ACP_FILE_CREDENTIAL_LIFECYCLE_FACTORIES: dict[
-    str, Callable[[LookupSecret], ACPFileCredentialLifecycle | None]
-] = {
-    CODEX_AUTH_SECRET_NAME: _create_codex_auth_lifecycle,
-}
+    @staticmethod
+    def _digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def create_file_credential_lifecycle(
-    secret_name: str, source: object
+    secret_name: str,
+    binding: VersionedCredentialBinding | None,
+    run_async: AsyncRunner,
 ) -> ACPFileCredentialLifecycle | None:
-    if not isinstance(source, LookupSecret):
+    if secret_name != CODEX_AUTH_SECRET_NAME or binding is None:
         return None
-    factory = _ACP_FILE_CREDENTIAL_LIFECYCLE_FACTORIES.get(secret_name)
-    return factory(source) if factory is not None else None
+    return _CodexAuthLifecycle(binding, run_async)
