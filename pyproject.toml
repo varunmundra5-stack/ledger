@@ -1,6 +1,8 @@
 # UV workspace configuration
+# `ledger` is this fork's only addition (the EBRM governance graft). Everything else is
+# upstream; keeping our code in one member keeps `git merge upstream/main` trivial.
 [tool.uv.workspace]
-members = ["openhands-sdk", "openhands-tools", "openhands-workspace", "openhands-agent-server"]
+members = ["openhands-sdk", "openhands-tools", "openhands-workspace", "openhands-agent-server", "ledger"]
 
 # Security: Apply workspace-wide dependency guardrails.
 [tool.uv]
@@ -20,6 +22,10 @@ constraint-dependencies = [
 
 # Workspace sources for intra-repo dependencies
 [tool.uv.sources]
+ledger-gate = { workspace = true }
+# The governed decision layer. Path source while it is co-developed; becomes a plain
+# PyPI dependency once `energy-orchestrator` is published.
+energy-orchestrator = { path = "../EBRM", editable = true }
 openhands-sdk = { workspace = true }
 openhands-tools = { workspace = true }
 openhands-workspace = { workspace = true }

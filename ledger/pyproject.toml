@@ -1,0 +1,22 @@
+[project]
+name = "ledger-gate"
+version = "0.1.0"
+description = "Governed agent harness — every routing decision and every committed action has an exact policy check and a receipt (EBRM gate on the OpenHands SDK)."
+requires-python = ">=3.12"
+dependencies = [
+    "openhands-sdk",
+    "energy-orchestrator",
+    "pyyaml>=6.0",
+]
+
+# DE-FORK RULE (H2): this package imports only PUBLIC `openhands.sdk.*` API. No relative
+# imports into the fork, no reliance on anything a `pip install openhands-sdk` user would
+# not have. The fork exists to run and demo this package, not to host it — when it earns
+# its keep, `ledger/` lifts out into its own repo unchanged.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ledger*"]
