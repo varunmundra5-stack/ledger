@@ -28,8 +28,7 @@ Ledger replaces the two decisions that matter with exact ones:
 | when it cannot comply | picks something reachable | **refuses** |
 | what it leaves behind | request logs | hash-chained decision receipts |
 
-The decision layer is [EBRM](https://github.com/varunmundra5-stack/ledger) —
-`energy_orchestrator`, a zero-dependency library where a decision is `argmin E` over
+The decision layer is **EBRM** (`energy_orchestrator`), a zero-dependency library where a decision is `argmin E` over
 candidates gated by an exact verifier, with calibrated refusal. No LLM runs anywhere in
 the gate, which is what makes it able to gate the LLM.
 
