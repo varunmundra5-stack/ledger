@@ -43,7 +43,7 @@ sensor; only the governance configuration differs.
 LEAK MATRIX — sovereign content reaching the cloud destination
 ==============================================================
                              stock    governed
-sovereign fragments            501           0
+sovereign fragments            508           0
 distinct chunks                 24           0
 tasks completed                 10          10
 tasks refused                    0           0
@@ -68,6 +68,51 @@ was allowed. The gate is context-dependent, not a blocklist.
 
 It is also falsifiable, and runs in CI as a test. If the governed arm ever leaks, or
 starts refusing work the stock arm completes, the build fails.
+
+## Live run
+
+The leak matrix is a replay. This is a real `Conversation` — real agent loop, real SDK
+`Message` objects reaching the router through the SDK's own call path
+(`python -m ledger.demo.live_local`, needs only Ollama):
+
+```
+── clean question  (lanes: local, cloud)
+   RESULT  cloud    labels=-
+── sovereign content pasted in  (lanes: local, cloud)
+   RESULT  local    labels=sovereign
+   session taint: sovereign
+── sovereign, cloud-only deployment  (lanes: cloud)
+   RESULT  REFUSED  labels=sovereign
+
+chain: intact (3 records)
+```
+
+**This run earned its keep by failing first.** On the initial attempt the pasted
+connection string routed to `cloud` with no labels — the gate missed it. A line
+fingerprint needs the whole line to match and a shingle needs eight consecutive words,
+so a lone credential lifted into new surrounding prose satisfied neither. The replay
+harness never caught it because there file content arrives as verbatim blocks.
+Classification now also fingerprints distinctive single tokens (≥16 chars containing a
+non-letter — every credential shape, no ordinary English word), with the exact live
+scenario pinned as a regression test.
+
+Two honest caveats on this run: with no cloud key both lanes are local Ollama endpoints
+(the "cloud" lane is a stand-in — every decision is real, but nothing crosses a network
+to a third party), and sovereign content arrives pasted rather than tool-read, because a
+3B model on an 8GB machine will not reliably call tools. The gate acts on the payload,
+not on how the payload arrived, so the routing decision exercised is the real one.
+
+## Deploy anywhere
+
+The gate does not have to be importable to be usable. `energy_orchestrator` ships an MCP
+server, so a harness in another language — or one we never forked — reaches the same
+decision over stdio. `ledger/gateway.py` implements both paths behind one seam, and the
+test suite runs every decision through both and asserts they agree:
+
+```python
+InProcessGate().decide("routing_policy", request)   # import and call
+McpGate().decide("routing_policy", request)         # separate process, over MCP
+```
 
 ## How it works
 
@@ -101,7 +146,8 @@ unconfigured router all refuse rather than route.
 ```bash
 uv sync
 python -m ledger.harness                 # the leak experiment, no API key needed
-python -m pytest ledger/tests -q         # 36 tests
+python -m ledger.demo.live_local         # live run (needs only `ollama serve`)
+python -m pytest ledger/tests -q         # 53 tests
 ```
 
 Live wiring against real models is in [`ledger/demo/sovereign_demo.py`](ledger/ledger/demo/sovereign_demo.py).
@@ -116,9 +162,18 @@ once the measurement holds up.
 
 ## Status
 
-Early. The gate, the router, the receipts, and the falsification harness work and are
-tested. Not yet done: live end-to-end runs against Kimi/NIM, the final-answer gate
-(upstream's `FinishAction` bypasses analyzers, so that one belongs in the driver), and
-the de-fork.
+Early, but the load-bearing parts are built and measured: classification, the sovereign
+router, the action gate, the final-answer gate, hash-chained receipts, the falsification
+harness, and the MCP path — 53 tests.
+
+Not yet done: a live run against a real cloud provider (needs a key; the wiring is
+written in `demo/sovereign_demo.py`), tool-driven sovereign reads at a model size this
+machine can host, and the de-fork.
+
+The final-answer gate deserves a note. Upstream exempts `FinishAction` from analyzers
+outright, and its `Stop` hook receives only a reason string rather than the answer — so
+the answer gate lives on the driver side, fed by a conversation callback. It withholds
+rather than redacts: a redacted answer would be a silent, unverifiable transformation,
+which is the thing this layer exists to replace.
 
 Licensed MIT, as upstream. Ledger's additions are in `ledger/`.

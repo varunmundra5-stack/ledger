@@ -362,3 +362,116 @@ class TestLeakExperiment:
         # t05 curls PyPI on a clean session; t10 curls after reading credentials.
         assert any(a.startswith("t05") for a in governed.actions_allowed)
         assert any(d.startswith("t10") for d in governed.actions_denied)
+
+
+# ── the final-answer gate ─────────────────────────────────────────────
+
+
+class _FakeFinish:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+
+class _FakeFinishEvent:
+    def __init__(self, message: str) -> None:
+        self.action = _FakeFinish(message)
+
+
+class TestFinalAnswerGate:
+    """Upstream exempts FinishAction from analyzers, so the answer is gated here."""
+
+    def _gate(self, workspace, index, policy_extra=None):
+        from ledger.classify import Governance
+        from ledger.final_answer import FinalAnswerGate
+
+        governance = Governance.load(workspace)
+        if policy_extra:
+            governance = Governance(
+                labels=governance.labels,
+                destinations=governance.destinations,
+                policy={**governance.policy, **policy_extra},
+            )
+        return FinalAnswerGate(index=index, governance=governance)
+
+    def test_answers_reach_the_operator_by_default(self, workspace, index) -> None:
+        """Showing sovereign content to the operator who owns it is not a leak."""
+        gate = self._gate(workspace, index)
+        assert gate.destination == "local"
+        assert gate.check(SECRET)["allowed"] is True
+
+    def test_sovereign_answer_is_withheld_when_transcripts_leave_the_box(
+        self, workspace, index
+    ) -> None:
+        gate = self._gate(workspace, index, {"answer_destination": "cloud"})
+        verdict = gate.check(f"The key is: {SECRET}")
+        assert verdict["allowed"] is False
+        assert verdict["labels"] == ["sovereign"]
+
+    def test_clean_answer_is_released_even_off_box(self, workspace, index) -> None:
+        gate = self._gate(workspace, index, {"answer_destination": "cloud"})
+        assert gate.check("format_widget returns a string.")["allowed"] is True
+
+    def test_release_withholds_rather_than_redacting(self, workspace, index) -> None:
+        from ledger.final_answer import release
+
+        gate = self._gate(workspace, index, {"answer_destination": "cloud"})
+        allowed, text = release(gate, f"Here it is: {SECRET}")
+        assert allowed is False
+        assert SECRET not in text and "withheld" in text
+
+    def test_the_callback_fires_on_finish_events(self, workspace, index) -> None:
+        gate = self._gate(workspace, index, {"answer_destination": "cloud"})
+        callback = gate.callback()
+        callback(_FakeFinishEvent(SECRET))
+        callback(_FakeActionEvent("TerminalTool", command="ls"))  # not a finish
+        assert len(gate.verdicts) == 1
+        assert gate.withheld
+
+
+# ── regression: the gap the live run found ────────────────────────────
+
+
+class TestLiftedSecretDetection:
+    """A live run pasted a connection string into new surrounding prose and the gate
+    missed it: a line fingerprint needs the whole line, a shingle needs eight
+    consecutive words, and a lone token satisfies neither."""
+
+    CONNECTION = "postgres://ledger_admin:Hn4x-Tuvq2@db.internal.example:5432/settle"
+
+    @pytest.fixture
+    def index(self, tmp_path) -> LabelIndex:
+        (tmp_path / "sovereign").mkdir()
+        (tmp_path / "sovereign" / "creds.txt").write_text(
+            f"{self.CONNECTION}\nAKIA4TQ7NRZP2WBXKLDM is the production access key\n",
+            encoding="utf-8",
+        )
+        return LabelIndex.build(tmp_path, Governance.load(tmp_path))
+
+    def test_secret_quoted_into_different_prose_is_caught(self, index) -> None:
+        pasted = f"Here is our connection string: {self.CONNECTION}\nWhich host?"
+        assert index.classify_text(pasted)["labels"] == ["sovereign"]
+
+    def test_bare_key_in_a_sentence_is_caught(self, index) -> None:
+        assert index.classify_text(
+            "I think the key AKIA4TQ7NRZP2WBXKLDM belongs to us."
+        )["labels"] == ["sovereign"]
+
+    def test_ordinary_long_words_never_qualify(self) -> None:
+        from ledger.classify import is_distinctive_token
+
+        for word in ("responsibilities", "internationalisation", "counterintuitive"):
+            assert not is_distinctive_token(word), word
+        for token in (
+            "AKIA4TQ7NRZP2WBXKLDM",
+            "postgres://a:b@c/d1234",
+            "8827-4419-6630-2258",
+        ):
+            assert is_distinctive_token(token), token
+
+    def test_unrelated_prose_stays_clean(self, index) -> None:
+        assert (
+            index.classify_text(
+                "Our responsibilities include internationalisation and documentation."
+            )["labels"]
+            == []
+        )

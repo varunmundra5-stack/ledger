@@ -37,6 +37,13 @@ SHINGLE_WORDS = 8
 # Lines shorter than this are ignored as standalone fingerprints (`{`, `import os`, a
 # bare number) — they appear in unlabelled files too and would fire constantly.
 MIN_LINE_CHARS = 24
+# A single token this long that also contains a non-letter is fingerprinted on its own.
+# Found by a live run: a connection string pasted into a chat matched NOTHING, because a
+# line fingerprint needs the whole line and a shingle needs eight consecutive words —
+# a lone secret quoted into new surrounding prose satisfies neither. Requiring a
+# non-letter keeps ordinary long words ("responsibilities") from ever qualifying, while
+# catching every credential shape: URLs, keys, hashes, hyphenated codes.
+TOKEN_MIN_CHARS = 16
 
 _WS = re.compile(r"\s+")
 
@@ -58,11 +65,16 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
+def is_distinctive_token(token: str) -> bool:
+    """A token long enough, and irregular enough, to identify content on its own."""
+    return len(token) >= TOKEN_MIN_CHARS and not token.isalpha()
+
+
 def fingerprints(text: str) -> set[str]:
-    """The set of content fingerprints for `text`: every long normalized line, plus
-    every
-    8-word shingle. Both, because secrets are short single lines while leaked prose is
-    long and may be re-wrapped."""
+    """Content fingerprints for `text`, at three granularities — because leaked
+    content takes three shapes: whole lines (a file copied verbatim), 8-word shingles
+    (quoted or re-wrapped prose), and lone distinctive tokens (a credential lifted
+    into new surrounding text)."""
     out: set[str] = set()
     for line in text.splitlines():
         normalized = _normalize(line)
@@ -71,6 +83,10 @@ def fingerprints(text: str) -> set[str]:
     words = _normalize(text).split()
     for i in range(len(words) - SHINGLE_WORDS + 1):
         out.add(_digest(" ".join(words[i : i + SHINGLE_WORDS])))
+    for word in words:
+        stripped = word.strip(".,;:!?()[]{}\"'")
+        if is_distinctive_token(stripped):
+            out.add(_digest(stripped))
     return out
 
 
@@ -227,6 +243,7 @@ __all__ = [
     "Governance",
     "LabelIndex",
     "event_text",
+    "is_distinctive_token",
     "fingerprints",
     "message_text",
 ]
