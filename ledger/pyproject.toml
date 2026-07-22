@@ -5,6 +5,7 @@ description = "Governed agent harness — every routing decision and every commi
 requires-python = ">=3.12"
 dependencies = [
     "openhands-sdk",
+    "openhands-tools",
     "energy-orchestrator",
     "pyyaml>=6.0",
 ]

@@ -1,0 +1,25 @@
+# Ledger governance for this repository (example — copy into any workspace).
+#
+# labels:       glob patterns -> a label. Files matching are fingerprinted, and any
+#               payload containing their content carries the label.
+# destinations: the routing lanes this deployment offers.
+# policy.hard:  inviolable deny-rules. A label may forbid destinations outright.
+# policy.prefer: soft ordering among the destinations that remain permitted; it can
+#               never overrule a hard deny (weighted 1000:1 against it).
+labels:
+  sovereign:
+    - "sovereign/**"
+    - "**/*.secret"
+
+destinations:
+  - local
+  - cloud
+
+policy:
+  hard:
+    - label: sovereign
+      deny: [cloud]
+  prefer:
+    default: cloud
+    when:
+      sovereign: local
